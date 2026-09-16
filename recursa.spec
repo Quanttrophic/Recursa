@@ -28,7 +28,7 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 APP_NAME = "Recursa"
 APP_MODULE = "recursa_app"
-APP_VERSION = "9.9.0"
+APP_VERSION = "9.9.1"
 BUNDLE_ID = "com.bearproperties.recursa"
 HERE = os.path.abspath(SPECPATH)
 SRC = os.path.join(HERE, "src")
