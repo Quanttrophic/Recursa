@@ -1,0 +1,9 @@
+# Build-time and runtime dependencies for the frozen Recursa app (Python 3.12).
+pyinstaller==6.22.3
+customtkinter==6.0.0
+darkdetect==0.8.0
+packaging==26.0
+psutil==7.2.2
+fsrs==6.3.2
+keyring==25.7.0
+pywin32-ctypes==0.2.3; sys_platform == "win32"

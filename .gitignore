@@ -1,0 +1,12 @@
+build/
+dist/
+release/
+.venv*/
+__pycache__/
+*.pyc
+*.spec.bak
+assets/recursa.icns
+assets/*.iconset/
+selfcheck.txt
+smoke.txt
+.DS_Store

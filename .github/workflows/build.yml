@@ -1,0 +1,211 @@
+# Recursa: build, check and release for Windows and macOS.
+#
+#   Every push and pull request, or "Run workflow" by hand:
+#       builds on Windows x64, macOS Apple silicon and macOS Intel, runs the
+#       frozen app's 89-class self-check and a window smoke test, and keeps
+#       the builds as downloadable artifacts for 14 days.
+#   Pushing a tag like v9.3.0:
+#       also packages a Windows installer and portable zip and a macOS .dmg
+#       for each chip, signs them when signing secrets are configured, writes
+#       SHA256SUMS.txt, and publishes a GitHub Release with all of them.
+name: Build Recursa
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write     # needed only to publish releases on tags
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      HAS_WINDOWS_CERT: ${{ secrets.WINDOWS_CERT_PFX_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then v="${GITHUB_REF#refs/tags/v}"; else v="9.3.0-dev.${GITHUB_RUN_NUMBER}"; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Install build requirements
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt
+
+      - name: Build app
+        env:
+          RECURSA_VERSION: ${{ steps.ver.outputs.version }}
+        run: pyinstaller --noconfirm --clean recursa.spec
+
+      - name: Self-check (frozen app)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath .\dist\Recursa\Recursa.exe -ArgumentList "--selfcheck","--report=selfcheck.txt" -Wait -PassThru
+          Get-Content selfcheck.txt | Select-Object -Last 5
+          if ($p.ExitCode -ne 0) { exit 1 }
+
+      - name: Smoke test (frozen app)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath .\dist\Recursa\Recursa.exe -ArgumentList "--smoke-test","--report=smoke.txt" -Wait -PassThru
+          Get-Content smoke.txt
+          if ($p.ExitCode -ne 0) { exit 1 }
+
+      - name: Sign app (if a certificate is configured)
+        if: startsWith(github.ref, 'refs/tags/v') && env.HAS_WINDOWS_CERT == 'true'
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        shell: pwsh
+        run: packaging\windows\sign.ps1 dist\Recursa\Recursa.exe
+
+      - name: Portable zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Compress-Archive -Path dist\Recursa -DestinationPath "release\Recursa-${{ steps.ver.outputs.version }}-windows-x64-portable.zip" -Force
+
+      - name: Installer (Inno Setup)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
+            choco install innosetup -y --no-progress
+            $env:Path += ";C:\Program Files (x86)\Inno Setup 6"
+          }
+          iscc /DAppVersion=${{ steps.ver.outputs.version }} packaging\windows\recursa.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Sign installer (if a certificate is configured)
+        if: startsWith(github.ref, 'refs/tags/v') && env.HAS_WINDOWS_CERT == 'true'
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        shell: pwsh
+        run: packaging\windows\sign.ps1 (Get-ChildItem release\*.exe).FullName
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recursa-windows-x64
+          path: release/*
+          retention-days: 14
+
+  macos:
+    name: macOS ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15          # Apple silicon
+            arch: arm64
+          - runner: macos-15-intel    # Intel; GitHub's last x86_64 image, available until August 2027
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Version
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then v="${GITHUB_REF#refs/tags/v}"; else v="9.3.0-dev.${GITHUB_RUN_NUMBER}"; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Install build requirements
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt
+
+      - name: App icon
+        run: bash scripts/make_icns.sh
+
+      - name: Build app
+        env:
+          RECURSA_VERSION: ${{ steps.ver.outputs.version }}
+        run: pyinstaller --noconfirm --clean recursa.spec
+
+      - name: Self-check (frozen app)
+        run: |
+          ./dist/Recursa.app/Contents/MacOS/Recursa --selfcheck --report=selfcheck.txt
+          tail -5 selfcheck.txt
+
+      - name: Smoke test (frozen app)
+        run: ./dist/Recursa.app/Contents/MacOS/Recursa --smoke-test
+
+      - name: Disk image (signed and notarized if Apple secrets are configured)
+        env:
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          mkdir -p release
+          DMG="release/Recursa-${{ steps.ver.outputs.version }}-macos-${{ matrix.arch }}.dmg"
+          if [[ "${GITHUB_REF}" == refs/tags/v* && -n "${APPLE_CERT_P12_BASE64}" ]]; then
+            bash packaging/macos/sign_and_notarize.sh "$DMG"
+          else
+            bash packaging/macos/make_dmg.sh "$DMG"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recursa-macos-${{ matrix.arch }}
+          path: release/*
+          retention-days: 14
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" artifacts/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "Recursa ${GITHUB_REF_NAME}" \
+            --notes "Windows: run the Setup .exe (or unzip the portable build). macOS: open the .dmg for your chip (Apple menu > About This Mac) and drag Recursa to Applications. Unsigned builds: see the README for the first-open steps. Progress is stored on the learner's own computer and is kept across updates."
