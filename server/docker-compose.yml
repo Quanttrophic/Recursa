@@ -1,0 +1,26 @@
+# One GPU box: vLLM serving a large open model, and the Recursa server in front of it.
+services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    command: ["--model", "${MODEL:-Qwen/Qwen3-235B-A22B-Instruct-2507-FP8}", "--tensor-parallel-size", "${TP:-4}",
+              "--max-model-len", "32768", "--enable-auto-tool-choice", "--tool-call-parser", "hermes"]
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
+    volumes: ["hf-cache:/root/.cache/huggingface"]
+  recursa:
+    build: .
+    ports: ["8080:8080"]
+    environment:
+      - RECURSA_TOKENS=${RECURSA_TOKENS:?set RECURSA_TOKENS}
+      - UPSTREAM_OPENAI_URL=http://vllm:8000/v1
+      - DEFAULT_MODEL=${MODEL:-Qwen/Qwen3-235B-A22B-Instruct-2507-FP8}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - EMBED_MODEL=${EMBED_MODEL:-BAAI/bge-small-en-v1.5}
+    depends_on: [vllm]
+volumes:
+  hf-cache:

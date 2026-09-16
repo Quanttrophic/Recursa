@@ -28,7 +28,7 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 APP_NAME = "Recursa"
 APP_MODULE = "recursa_app"
-APP_VERSION = "9.6.0"
+APP_VERSION = "9.7.0"
 BUNDLE_ID = "com.bearproperties.recursa"
 HERE = os.path.abspath(SPECPATH)
 SRC = os.path.join(HERE, "src")
@@ -44,7 +44,7 @@ datas += collect_data_files("fsrs")
 hiddenimports = [APP_MODULE]
 hiddenimports += collect_submodules("keyring.backends")   # the OS keychain backend is chosen at runtime
 hiddenimports += collect_submodules("fsrs")
-hiddenimports += ["darkdetect", "packaging", "psutil"]
+hiddenimports += ["darkdetect", "packaging", "psutil", "httpx", "pydantic", "rank_bm25", "rapidfuzz", "pypdf"]
 if sys.platform == "win32":
     hiddenimports += ["win32ctypes.core", "winsound"]
 
