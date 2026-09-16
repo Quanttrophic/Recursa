@@ -4,7 +4,7 @@
 #       builds on Windows x64, macOS Apple silicon and macOS Intel, runs the
 #       frozen app's 89-class self-check and a window smoke test, and keeps
 #       the builds as downloadable artifacts for 14 days.
-#   Pushing a tag like v9.9.1:
+#   Pushing a tag like v10.0.0:
 #       also packages a Windows installer and portable zip and a macOS .dmg
 #       for each chip, signs them when signing secrets are configured, writes
 #       SHA256SUMS.txt, and publishes a GitHub Release with all of them.
@@ -47,7 +47,7 @@ jobs:
         id: ver
         shell: bash
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then v="${GITHUB_REF#refs/tags/v}"; else v="9.9.1-dev.${GITHUB_RUN_NUMBER}"; fi
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then v="${GITHUB_REF#refs/tags/v}"; else v="10.0.0-dev.${GITHUB_RUN_NUMBER}"; fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
       - name: Install build requirements
@@ -137,7 +137,7 @@ jobs:
       - name: Version
         id: ver
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then v="${GITHUB_REF#refs/tags/v}"; else v="9.9.1-dev.${GITHUB_RUN_NUMBER}"; fi
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then v="${GITHUB_REF#refs/tags/v}"; else v="10.0.0-dev.${GITHUB_RUN_NUMBER}"; fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
       - name: Install build requirements

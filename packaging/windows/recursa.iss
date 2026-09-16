@@ -1,11 +1,11 @@
 ; Inno Setup script for Recursa (Windows installer).
-; Built by .github/workflows/build.yml:  iscc /DAppVersion=9.9.1 packaging\windows\recursa.iss
+; Built by .github/workflows/build.yml:  iscc /DAppVersion=10.0.0 packaging\windows\recursa.iss
 ; Installs per user (no administrator rights), adds a Start menu entry, an
 ; optional desktop shortcut and an uninstaller. The learner's progress lives in
 ; %USERPROFILE%\.nj_re_trainer and is never touched by install or uninstall.
 
 #ifndef AppVersion
-  #define AppVersion "9.9.1"
+  #define AppVersion "10.0.0"
 #endif
 
 [Setup]

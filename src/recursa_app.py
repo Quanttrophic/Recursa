@@ -40731,6 +40731,10 @@ def view_today(app, parent):
         except Exception as e:
             _audit(conn, "suggestion_strip_failed", f"{type(e).__name__}: {e}")
 
+    # ---- where to aim (V10 targeted plan) ----
+    if total_attempts and diag is not None and "plan" in _show:
+        render_plan_card(app, wrap)
+
     # ---- why this, today ----
     wc = card(wrap, fg_color=C.PAPER_DIM)
     wc.pack(fill="x", pady=(0, 14))
@@ -51325,7 +51329,10 @@ def view_sort(app, parent):
         _v95_label(wrap, "No lookalike pairs have questions yet.")
         return
     labels = {f"{SKILLS[p['a']]['label']}  /  {SKILLS[p['b']]['label']}": p for p in pairs}
-    var = ctk.StringVar(value=next(iter(labels)))
+    _pre = getattr(app, "_sort_preselect", None)
+    app._sort_preselect = None
+    var = ctk.StringVar(value=next((k for k, p in labels.items() if _pre and set(_pre) == {p["a"], p["b"]}),
+                                   next(iter(labels))))
     ctk.CTkOptionMenu(wrap, values=list(labels), variable=var, command=lambda _v: build(), width=520).pack(anchor="w")
     board = ctk.CTkFrame(wrap, fg_color="transparent")
     board.pack(fill="both", expand=True, pady=(10, 0))
@@ -51465,8 +51472,12 @@ def view_teach(app, parent):
     vs = gather_visual_state(conn)
     started = [s for s in sorted(SKILLS) if vs["tiers"].get(s) not in (TIER_NOT_STARTED, None) and items_for_skill(s)]
     pool = started or [s for s in sorted(SKILLS) if items_for_skill(s)]
+    _tpre = getattr(app, "_teach_preselect", None)
+    app._teach_preselect = None
+    if _tpre in SKILLS and _tpre not in pool and items_for_skill(_tpre):
+        pool = [_tpre] + pool
     labels = {SKILLS[s]["label"]: s for s in pool}
-    var = ctk.StringVar(value=next(iter(labels)))
+    var = ctk.StringVar(value=SKILLS[_tpre]["label"] if _tpre in SKILLS and SKILLS[_tpre]["label"] in labels else next(iter(labels)))
     ctk.CTkOptionMenu(wrap, values=list(labels), variable=var, width=520, command=lambda _v: begin()).pack(anchor="w")
     stage = ctk.CTkFrame(wrap, fg_color="transparent")
     stage.pack(fill="x", pady=(10, 0))
@@ -56895,6 +56906,753 @@ for _name, _spec in (
         "found_in": "V9 to V9.9 differential audit.", "probe": _probe_v991_model_pins}),
 ):
     register_adversarial_class(_name, _spec)
+
+
+# ===========================================================================
+# V10 -- TARGETED PLANS: DIAGNOSIS, PRESCRIPTION, PROOF
+# ===========================================================================
+# The earlier Recursa told the learner where to aim: a "Today's plan" with
+# blocks, cluster diagnosis with "Diagnose & treat", error-log briefs with
+# "apply it to unseen items", and skill dossiers with a to-do list. Those
+# functions still exist, but behind author views and without a shared record.
+# V10 turns them into one governed target engine:
+#   diagnose  -> a target with its observed evidence (measurement rows only)
+#   rank      -> a transparent priority from severity, breadth, consequence,
+#                urgency and evidence strength, per minute of work, with the
+#                earlier plan's phasing rule (content before pace)
+#   prescribe -> a concrete activity; where two activities are both plausible,
+#                assignment is randomized with a logged propensity, so what
+#                works is identified by design, not read from confounded lifts
+#   prove     -> a spaced check on reserved questions the learner has not seen,
+#                counted only from measurement-eligible answers; relapse reopens
+# All learner-facing text is words and counts; nothing claims a cause.
+
+TARGET_WINDOW_DAYS = 45
+PROOF_SPACING_HOURS = 20
+PROOF_RESERVE_PER_SKILL = 2
+PROOF_NEEDED_CORRECT = 2
+RELAPSE_WINDOW_DAYS = 14
+TARGET_EXPIRE_DAYS = 21
+
+TARGET_TYPES = {
+    "blind_spot": {"consequence": 1.0, "dose": 8, "arms": ("retrieve_with_explanation", "teach_back"),
+                   "fixed": "two new questions on this skill answered correctly on different days, one of them with confidence"},
+    "confusable_pair": {"consequence": 0.8, "dose": 10, "arms": ("contrast_pair", "retrieve_with_explanation"),
+                        "fixed": "new questions on both skills answered correctly on different days"},
+    "prerequisite": {"consequence": 0.9, "dose": 12, "arms": ("prereq_drill",),
+                     "fixed": "two new questions on the underlying skill answered correctly on different days"},
+    "shared_idea": {"consequence": 0.8, "dose": 10, "arms": ("retrieve_with_explanation", "teach_back"),
+                    "fixed": "two new questions touching the same idea answered correctly on different days"},
+    "fading": {"consequence": 0.45, "dose": 6, "arms": ("spaced_review",),
+               "fixed": "each of these skills recalled again on its due day"},
+    "pressure": {"consequence": 0.7, "dose": 15, "arms": ("graded_timed",),
+                 "fixed": "timed practice no longer trailing untimed practice"},
+    "pace": {"consequence": 0.5, "dose": 8, "arms": ("paced_drill",),
+             "fixed": "three of these answered correctly within exam pace"},
+    "unprobed": {"consequence": 0.45, "dose": 8, "arms": ("probe_set",),
+                 "fixed": "a few answers in each of these areas"},
+}
+PRESCRIPTION_WORDS = {
+    "retrieve_with_explanation": "Answer the missed questions again, saying why before each answer is shown.",
+    "teach_back": "Explain the skill to a confused student in Teach It, then answer questions on it.",
+    "contrast_pair": "Sort situations between the two ideas in Sort It, with the separating fact after each slip.",
+    "prereq_drill": "Practise the underlying skill first; the questions that depend on it come after.",
+    "spaced_review": "A short review of these skills on the day they are due.",
+    "graded_timed": "The next rung of the timed ladder, at a pace that builds up gradually.",
+    "paced_drill": "The same questions again, at exam pace.",
+    "probe_set": "A few questions in each area, so the app has something to go on.",
+    "worked_example": "A worked example in Maths Lab, with the steps handed over one at a time.",
+}
+# How many observations make each kind of target serious: one confident miss already
+# matters; a dozen skills coming due is routine upkeep.
+SEVERITY_SCALE = {"blind_spot": 1.5, "confusable_pair": 2.0, "prerequisite": 2.0, "shared_idea": 2.0,
+                  "fading": 12.0, "pressure": 1.0, "pace": 6.0, "unprobed": 3.0}
+CONTENT_TYPES = ("blind_spot", "confusable_pair", "prerequisite", "shared_idea")
+
+for _t, _spec in TARGET_TYPES.items():
+    if len(_spec["arms"]) == 2:
+        BEHAVIOUR_TRIALS[f"target_{_t}"] = {
+            "share": 0.5, "floor": 6, "settle_at": 30,
+            "outcome": "whether the target's proof check passes within three weeks of starting",
+            "basis": "Two plausible activities for the same diagnosis; randomized so the better one is identified.",
+        }
+        register_behaviour_trial(f"target_{_t}", ("target_activity_choice",),
+                                 "Both activities practise the same skill; explanations, answers and feedback are "
+                                 "shown in both, and neither arm withholds anything the learner needs.")
+
+
+def init_target_schema(conn):
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS targets (key TEXT PRIMARY KEY, type TEXT, skills TEXT, items TEXT, evidence TEXT,
+            prescription TEXT, arm_assigned INTEGER, priority REAL, components TEXT, status TEXT, reserve TEXT,
+            created_at TEXT, updated_at TEXT, started_at TEXT, proven_at TEXT, relapses INTEGER DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS target_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, key TEXT, event TEXT,
+            detail TEXT);
+    """)
+    conn.commit()
+
+
+def _target_event(conn, key, event, detail=""):
+    conn.execute("INSERT INTO target_events (ts, key, event, detail) VALUES (?,?,?,?)",
+                 (datetime.now().isoformat(), key, event, detail))
+
+
+# ---- diagnosis (measurement-eligible evidence only) ------------------------------------------------
+
+def _recent_rows(conn, days=TARGET_WINDOW_DAYS):
+    since = (datetime.now() - timedelta(days=days)).isoformat()
+    try:
+        return measurement_rows(conn, where="timestamp >= ?", params=(since,),
+                                columns="id, question_id, correct, confidence, time_taken, timestamp, mode")
+    except Exception:
+        return []
+
+
+def diagnose_targets(conn):
+    rows = _recent_rows(conn)
+    out = []
+    by_skill_miss, confident_miss = {}, {}
+    for r in rows:
+        for sid in Q_MATRIX.get(r["question_id"], []):
+            if not r["correct"]:
+                by_skill_miss.setdefault(sid, set()).add(r["question_id"])
+                if r["confidence"] == 3:
+                    confident_miss.setdefault(sid, set()).add(r["question_id"])
+    # 1. sure but wrong
+    for sid, qids in confident_miss.items():
+        if len(qids) >= 2 and sid in SKILLS:
+            out.append({"type": "blind_spot", "skills": [sid], "items": sorted(qids), "count": len(qids),
+                        "title": f"Sure but wrong: {SKILLS[sid]['label']}",
+                        "evidence": [f"{len(qids)} questions on this skill answered confidently and missed in the last "
+                                     f"{TARGET_WINDOW_DAYS} days."]})
+    # 2. lookalike pairs with misses on both sides
+    for p in vis_confusion_pairs():
+        a, b = by_skill_miss.get(p["a"], set()), by_skill_miss.get(p["b"], set())
+        if a and b and len(a | b) >= 2:
+            out.append({"type": "confusable_pair", "skills": [p["a"], p["b"]], "items": sorted(a | b),
+                        "count": len(a | b),
+                        "title": f"Telling apart: {SKILLS[p['a']]['label']} / {SKILLS[p['b']]['label']}",
+                        "evidence": [f"Misses on both of these lookalike skills recently ({len(a)} and {len(b)} questions).",
+                                     f"What separates them: {p.get('why') or 'see Sort It'}"]})
+    # 3. an underlying skill several missed skills rest on
+    roots = {}
+    for sid in by_skill_miss:
+        try:
+            bnk = upstream_bottleneck(conn, sid)
+        except Exception:
+            bnk = None
+        if bnk and bnk.get("skill") in SKILLS and bnk["skill"] != sid:
+            roots.setdefault(bnk["skill"], set()).add(sid)
+    for root, deps in roots.items():
+        if len(deps) >= 2:
+            items = sorted({q for d in deps for q in by_skill_miss[d]})
+            out.append({"type": "prerequisite", "skills": [root], "items": items, "count": len(deps),
+                        "title": f"Underlying skill: {SKILLS[root]['label']}",
+                        "evidence": [f"Misses on {len(deps)} skills that build on this one: "
+                                     + ", ".join(SKILLS[d]["label"] for d in sorted(deps)[:3]) + "."]})
+    # 4. misses that share a named idea (the earlier cluster diagnosis)
+    concepts = {}
+    for r in rows:
+        if r["correct"]:
+            continue
+        try:
+            m = enriched_misconception(r["question_id"])
+        except Exception:
+            m = None
+        if m and m.get("concept"):
+            concepts.setdefault(m["concept"], set()).add(r["question_id"])
+    for concept, qids in concepts.items():
+        if len(qids) >= 2:
+            d = diagnose_cluster(conn, sorted(qids)) or {}
+            sids = sorted({s for q in qids for s in Q_MATRIX.get(q, [])})
+            out.append({"type": "shared_idea", "skills": sids[:3], "items": sorted(qids), "count": len(qids),
+                        "title": f"Misses around one idea: {concept[:70]}",
+                        "evidence": [f"{len(qids)} missed questions share this idea."]
+                        + (["These misses are mostly under a clock."] if d.get("timed_only") else []),
+                        "timed_only": bool(d.get("timed_only"))})
+    # 5. solid skills due for review
+    try:
+        vs = gather_visual_state(conn)
+    except Exception:
+        vs = {"tiers": {}, "due_on": {}, "answers": {}}
+    today = date.today().isoformat()
+    due = sorted(s for s, d in vs.get("due_on", {}).items() if d and d <= today
+                 and COARSE_OF.get(vs["tiers"].get(s)) in (COARSE_BUILDING, COARSE_STRONG))
+    if len(due) >= 3:
+        out.append({"type": "fading", "skills": due[:12], "items": [], "count": len(due),
+                    "title": f"Keeping {len(due)} built-up skills from fading",
+                    "evidence": [f"{len(due)} skills you have built up are due for their next recall today."]})
+    # 6. pressure
+    try:
+        prof = pressure_profile(conn) or {}
+    except Exception:
+        prof = {}
+    if prof.get("pressure_limited") and prof.get("confident"):
+        out.append({"type": "pressure", "skills": [], "items": [], "count": 1,
+                    "title": "Showing what you know under a clock",
+                    "evidence": ["Timed practice is trailing untimed practice by more than chance would explain."]})
+    # 7. pace
+    try:
+        ts = timing_summary(conn) or {}
+    except Exception:
+        ts = {}
+    slow = []
+    for r in ts.get("slow_correct") or []:
+        if r["question_id"] not in slow and r["question_id"] in QUIZ_BANK:
+            slow.append(r["question_id"])
+    if len(slow) >= 4:
+        out.append({"type": "pace", "skills": sorted({s for q in slow for s in Q_MATRIX.get(q, [])})[:6],
+                    "items": slow[:8], "count": len(slow), "title": "Speed on questions you already get right",
+                    "evidence": [f"{len(slow)} questions answered correctly but well past exam pace."]})
+    # 8. areas with little evidence (after a baseline exists)
+    if rows:
+        thin = [t for t in vis_domain_order() if sum(vs.get("answers", {}).get(s, 0) for s in vis_skills_of(t)) < 3]
+        if thin:
+            out.append({"type": "unprobed", "skills": [s for t in thin[:3] for s in vis_skills_of(t)][:9], "items": [],
+                        "count": len(thin), "areas": thin[:3],
+                        "title": "Areas with not much evidence yet",
+                        "evidence": ["Few or no answers yet in: "
+                                     + ", ".join(TOPICS[t].get("short") or TOPICS[t]["name"] for t in thin[:3]) + "."]})
+    for t in out:
+        t["key"] = t["type"] + "|" + ",".join(sorted(t["skills"]) or [t["type"]])
+    return out
+
+
+# ---- priority ---------------------------------------------------------------------------------------
+
+def target_priority(target, days_left=None, content_pressing=False):
+    spec = TARGET_TYPES[target["type"]]
+    severity = 1.0 - math.exp(-float(target.get("count", 1)) / SEVERITY_SCALE[target["type"]])
+    breadth = (min(1.0, len(target.get("skills") or []) / 3.0)
+               if target["type"] in ("prerequisite", "shared_idea", "confusable_pair") else 1.0)
+    consequence = spec["consequence"]
+    urgency = 1.0 if (days_left is not None and days_left <= 14) else 0.85 if (days_left is not None and days_left <= 45) else 0.7
+    evidence = min(1.0, len(target.get("items") or []) / 4.0) if target.get("items") else 0.75
+    phasing = 1.0
+    if target["type"] in ("pressure", "pace") and content_pressing and not (days_left is not None and days_left <= 14):
+        phasing = 0.6          # the earlier plan's rule: repair content before pace, unless the exam is close
+    value = severity * (0.5 + 0.5 * breadth) * consequence * urgency * (0.6 + 0.4 * evidence) * phasing
+    priority = value / math.sqrt(spec["dose"] / 10.0)
+    return priority, {"severity": round(severity, 4), "breadth": round(breadth, 4), "consequence": consequence,
+                      "urgency": urgency, "evidence": round(evidence, 4), "phasing": phasing, "dose": spec["dose"],
+                      "value": round(value, 4)}
+
+
+# ---- prescription (identified choice) ----------------------------------------------------------------
+
+def choose_prescription(conn, target):
+    arms = TARGET_TYPES[target["type"]]["arms"]
+    if target["type"] == "shared_idea" and target.get("timed_only"):
+        return "graded_timed", None
+    if target["type"] == "blind_spot" and target["skills"] and SKILLS[target["skills"][0]]["topic"] == "t10":
+        arms = ("retrieve_with_explanation", "worked_example")
+    if len(arms) == 1:
+        return arms[0], None
+    on = behaviour_arm(conn, f"target_{target['type']}", target["key"])
+    return (arms[0] if on else arms[1]), int(bool(on))
+
+
+def eligible_unseen_items(conn, sid, exclude=()):
+    """Questions on the skill never attempted, with no answer exposure, and usable as measurement."""
+    init_provenance_schema(conn)
+    tried = {r[0] for r in conn.execute("SELECT DISTINCT question_id FROM attempts").fetchall()}
+    exposed = {r[0] for r in conn.execute("SELECT DISTINCT question_id FROM content_exposure WHERE seen_answer=1").fetchall()}
+    out = []
+    for q in items_for_skill(sid):
+        if q["id"] in tried or q["id"] in exposed or q["id"] in exclude:
+            continue
+        if content_class(q["id"]) == "personal" and not personal_promoted(conn, q["id"]):
+            continue
+        if str(q["id"]).startswith(("gen-", "cand-")):
+            continue
+        out.append(q["id"])
+    return out
+
+
+# ---- the lifecycle ----------------------------------------------------------------------------------------
+
+def refresh_targets(conn):
+    """Diagnose, rank, create or update targets, check proofs, detect relapse,
+    expire stale ones and settle randomized activity choices. Idempotent."""
+    init_target_schema(conn)
+    init_provenance_schema(conn)
+    now = datetime.now()
+    try:
+        days_left = days_to_exam(conn)
+    except Exception:
+        days_left = None
+    found = diagnose_targets(conn)
+    content_pressing = any(t["type"] in CONTENT_TYPES and t.get("count", 0) >= 3 for t in found)
+    seen_keys = set()
+    for t in found:
+        seen_keys.add(t["key"])
+        prio, comps = target_priority(t, days_left, content_pressing)
+        row = conn.execute("SELECT status, prescription, arm_assigned, reserve FROM targets WHERE key=?", (t["key"],)).fetchone()
+        if row is None:
+            rx, arm = choose_prescription(conn, t)
+            reserve = []
+            for sid in (t["skills"] if t["type"] in CONTENT_TYPES else [])[:2]:
+                reserve += eligible_unseen_items(conn, sid, exclude=set(t["items"]) | set(reserve))[:PROOF_RESERVE_PER_SKILL]
+            status = "open" if (reserve or t["type"] not in CONTENT_TYPES) else "needs_more_questions"
+            conn.execute("INSERT INTO targets (key, type, skills, items, evidence, prescription, arm_assigned, priority, "
+                         "components, status, reserve, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (t["key"], t["type"], json.dumps(t["skills"]), json.dumps(t["items"]),
+                          json.dumps({"title": t["title"], "lines": t["evidence"], "areas": t.get("areas")}), rx, arm, prio,
+                          json.dumps(comps), status, json.dumps(reserve), now.isoformat(), now.isoformat()))
+            _target_event(conn, t["key"], "created", rx)
+        else:
+            conn.execute("UPDATE targets SET items=?, evidence=?, priority=?, components=?, updated_at=? WHERE key=?",
+                         (json.dumps(t["items"]), json.dumps({"title": t["title"], "lines": t["evidence"],
+                                                              "areas": t.get("areas")}),
+                          prio, json.dumps(comps), now.isoformat(), t["key"]))
+            if row[0] == "proven":
+                pass
+    for key, ttype, skills, items, status, started, reserve, proven_at in conn.execute(
+            "SELECT key, type, skills, items, status, started_at, reserve, proven_at FROM targets").fetchall():
+        skills, items, reserve = json.loads(skills or "[]"), json.loads(items or "[]"), json.loads(reserve or "[]")
+        if status in ("in_treatment", "proof_due") and started:
+            proof = proof_state(conn, ttype, skills, items, reserve, started)
+            if proof["proven"]:
+                conn.execute("UPDATE targets SET status='proven', proven_at=? WHERE key=?", (now.isoformat(), key))
+                _target_event(conn, key, "proven")
+                _settle_target_trial(conn, ttype, key, 1.0)
+            elif proof["treated"] and status == "in_treatment":
+                conn.execute("UPDATE targets SET status='proof_due' WHERE key=?", (key,))
+                _target_event(conn, key, "proof_due")
+            elif (now - datetime.fromisoformat(started)).days >= TARGET_EXPIRE_DAYS:
+                conn.execute("UPDATE targets SET status='expired' WHERE key=?", (key,))
+                _target_event(conn, key, "expired")
+                _settle_target_trial(conn, ttype, key, 0.0)
+        elif status == "proven" and proven_at and skills:
+            since = proven_at
+            limit = (datetime.fromisoformat(proven_at) + timedelta(days=RELAPSE_WINDOW_DAYS)).isoformat()
+            miss = measurement_rows(conn, where="timestamp > ? AND timestamp <= ? AND correct=0", params=(since, limit),
+                                    columns="question_id")
+            if any(set(Q_MATRIX.get(r["question_id"], [])) & set(skills) for r in miss) and ttype in CONTENT_TYPES:
+                conn.execute("UPDATE targets SET status='open', started_at=NULL, proven_at=NULL, relapses=relapses+1 "
+                             "WHERE key=?", (key,))
+                _target_event(conn, key, "relapsed")
+        elif status == "open" and key not in seen_keys:
+            conn.execute("UPDATE targets SET status='resolved_without_treatment' WHERE key=?", (key,))
+            _target_event(conn, key, "no_longer_observed")
+    conn.commit()
+    return active_targets(conn)
+
+
+def _settle_target_trial(conn, ttype, key, outcome):
+    if f"target_{ttype}" in BEHAVIOUR_TRIALS:
+        try:
+            record_behaviour_outcome(conn, f"target_{ttype}", key, outcome)
+        except Exception:
+            pass
+
+
+def proof_state(conn, ttype, skills, items, reserve, started):
+    """Treatment = any attempt on the target's skills or items after starting.
+    Proof (content targets) = measurement-eligible correct answers on questions
+    outside the treatment set, on at least two calendar days, the most recent
+    answers on these skills correct; blind spots also need one confident answer."""
+    after = conn.execute("SELECT question_id, correct, confidence, timestamp, mode, time_taken FROM attempts "
+                         "WHERE timestamp > ? ORDER BY id", (started,)).fetchall()
+    on_target = [r for r in after if r[0] in items or set(Q_MATRIX.get(r[0], [])) & set(skills)]
+    treated = bool(on_target)
+    if ttype in CONTENT_TYPES:
+        eligible = measurement_rows(conn, where="timestamp > ?", params=(started,),
+                                    columns="question_id, correct, confidence, timestamp")
+        fresh = [r for r in eligible if r["question_id"] not in items and set(Q_MATRIX.get(r["question_id"], [])) & set(skills)]
+        right = [r for r in fresh if r["correct"]]
+        days = {r["timestamp"][:10] for r in right}
+        last_two = [r["correct"] for r in fresh][-2:]
+        confident = any(r["confidence"] == 3 for r in right)
+        proven = (len({r["question_id"] for r in right}) >= PROOF_NEEDED_CORRECT and len(days) >= 2
+                  and all(last_two) and (ttype != "blind_spot" or confident))
+        return {"treated": treated, "proven": proven, "right": len(right), "days": len(days)}
+    if ttype == "fading":
+        vs = gather_visual_state(conn)
+        today = date.today().isoformat()
+        still_due = [s for s in skills if (vs["due_on"].get(s) or "9999") <= today]
+        return {"treated": treated, "proven": treated and not still_due}
+    if ttype == "pressure":
+        prof = pressure_profile(conn) or {}
+        return {"treated": treated, "proven": treated and not prof.get("pressure_limited")}
+    if ttype == "pace":
+        quick = {r[0] for r in on_target if r[1] and r[5] and r[5] <= PACE_TARGET_SECONDS}
+        return {"treated": treated, "proven": len(quick & set(items)) >= 3}
+    if ttype == "unprobed":
+        vs = gather_visual_state(conn)
+        return {"treated": treated, "proven": all(vs["answers"].get(s, 0) >= 1 for s in skills[:3])}
+    return {"treated": treated, "proven": False}
+
+
+def active_targets(conn, limit=None):
+    init_target_schema(conn)
+    rows = conn.execute("SELECT key, type, skills, items, evidence, prescription, arm_assigned, priority, status, "
+                        "reserve, started_at, relapses FROM targets WHERE status IN "
+                        "('open','in_treatment','proof_due','needs_more_questions') ORDER BY "
+                        "CASE status WHEN 'proof_due' THEN 0 WHEN 'in_treatment' THEN 1 ELSE 2 END, priority DESC").fetchall()
+    out = []
+    for r in rows[: limit or len(rows)]:
+        ev = json.loads(r[4] or "{}")
+        out.append({"key": r[0], "type": r[1], "skills": json.loads(r[2] or "[]"), "items": json.loads(r[3] or "[]"),
+                    "title": ev.get("title", ""), "evidence": ev.get("lines", []), "prescription": r[5],
+                    "randomized": r[6] is not None, "priority": r[7], "status": r[8],
+                    "reserve": json.loads(r[9] or "[]"), "started_at": r[10], "relapses": r[11],
+                    "fixed": TARGET_TYPES[r[1]]["fixed"], "dose": TARGET_TYPES[r[1]]["dose"]})
+    return out
+
+
+def proof_ready(target, now=None):
+    if target["status"] != "proof_due" or not target.get("started_at"):
+        return False
+    now = now or datetime.now()
+    return (now - datetime.fromisoformat(target["started_at"])).total_seconds() >= PROOF_SPACING_HOURS * 3600
+
+
+STATUS_WORDS = {"open": "Not started", "in_treatment": "In progress", "proof_due": "Ready to check",
+                "needs_more_questions": "Needs more questions to check", "proven": "Fixed",
+                "expired": "Set aside", "resolved_without_treatment": "No longer showing up"}
+
+
+# ---- starting work --------------------------------------------------------------------------------------
+
+def start_target(app, target):
+    conn = app.conn
+    init_target_schema(conn)
+    if target["status"] == "open":
+        conn.execute("UPDATE targets SET status='in_treatment', started_at=? WHERE key=?",
+                     (datetime.now().isoformat(), target["key"]))
+        _target_event(conn, target["key"], "started", target["prescription"])
+        conn.commit()
+    rx = target["prescription"]
+    reserve = set(target.get("reserve") or [])
+    if rx == "contrast_pair" and len(target["skills"]) == 2:
+        app._sort_preselect = tuple(target["skills"])
+        return app.show_view("sortit")
+    if rx == "teach_back" and target["skills"]:
+        app._teach_preselect = target["skills"][0]
+        return app.show_view("teachit")
+    if rx == "worked_example":
+        return app.show_view("mathlab")
+    if rx == "graded_timed":
+        return app.show_view("progressive")
+    if rx in ("spaced_review", "probe_set", "prereq_drill"):
+        sids = target["skills"][:6]
+        pool = [q["id"] for s in sids for q in items_for_skill(s) if q["id"] not in reserve][:10]
+        return drill_questions(app, pool, target["title"], PRESCRIPTION_WORDS[rx], back="plan")
+    if rx == "paced_drill":
+        return drill_questions(app, target["items"], target["title"], PRESCRIPTION_WORDS[rx], timed=True, back="plan")
+    ids = [q for q in target["items"] if q not in reserve]
+    if target["type"] == "confusable_pair":
+        ids += [q["id"] for s in target["skills"] for q in items_for_skill(s) if q["id"] not in reserve and q["id"] not in ids][:4]
+    sess = drill_questions(app, ids[:10], target["title"], PRESCRIPTION_WORDS[rx], back="plan")
+    if sess is not None and rx == "retrieve_with_explanation":
+        sess._force_explain = True
+    return sess
+
+
+def check_target(app, target):
+    ids = [q for q in target.get("reserve") or [] if q in QUIZ_BANK]
+    if not ids:
+        extra = []
+        for s in target["skills"][:2]:
+            extra += eligible_unseen_items(app.conn, s, exclude=set(target["items"]))[:PROOF_RESERVE_PER_SKILL]
+        ids = extra
+    if not ids:
+        app.toast("There are no new questions on this skill yet to check it with.", kind="info")
+        return None
+    return drill_questions(app, ids, "Checking: " + target["title"],
+                           "New questions you haven't seen, spaced from the practice.", back="plan")
+
+
+_explain_wanted_v95 = explain_wanted
+
+
+def explain_wanted(session, q):
+    if getattr(session, "_force_explain", False) and getattr(session, "_explain_resume", None) is None:
+        if not hasattr(session, "_explained"):
+            session._explained = set()
+        return (session.index not in session._explained
+                and explain_eligible(q, session.timed, session._effective_mode()))
+    return _explain_wanted_v95(session, q)
+
+
+def render_plan_card(app, wrap, limit=3):
+    conn = app.conn
+    app._plan_card = []
+    try:
+        targets = refresh_targets(conn)
+    except Exception as e:     # noqa: BLE001
+        _audit(conn, "targets_failed", f"{type(e).__name__}: {e}")
+        return None
+    if gentle_state(conn)["active"]:
+        targets = [t for t in targets if TARGET_TYPES[t["type"]]["dose"] <= 8][:1]
+    if not targets:
+        return None
+    c = card(wrap, fg_color=C.PAPER_DIM)
+    c.pack(fill="x", pady=(0, 14))
+    i = ctk.CTkFrame(c, fg_color="transparent")
+    i.pack(fill="x", padx=18, pady=12)
+    head = ctk.CTkFrame(i, fg_color="transparent")
+    head.pack(fill="x")
+    ctk.CTkLabel(head, text="Where to aim", font=(FONT_BODY, 13, "bold"), text_color=C.INK).pack(side="left")
+    ghost_button(head, "All targets", lambda: app.show_view("plan"), width=90).pack(side="right")
+    for t in targets[:limit]:
+        row = ctk.CTkFrame(i, fg_color="transparent")
+        row.pack(fill="x", pady=(8, 0))
+        txt = ctk.CTkFrame(row, fg_color="transparent")
+        txt.pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(txt, text=t["title"], font=(FONT_BODY, 12, "bold"), text_color=C.INK, anchor="w",
+                     justify="left", wraplength=560).pack(anchor="w")
+        ctk.CTkLabel(txt, text=f"{t['evidence'][0] if t['evidence'] else ''}  \u00b7  about {t['dose']} min  \u00b7  "
+                               f"{STATUS_WORDS[t['status']]}", font=(FONT_BODY, 11), text_color=C.INK_DIM, anchor="w",
+                     justify="left", wraplength=560).pack(anchor="w")
+        if proof_ready(t):
+            ghost_button(row, "Check it", lambda t=t: check_target(app, t), width=80).pack(side="right")
+        elif t["status"] == "proof_due":
+            ctk.CTkLabel(row, text="Check tomorrow", font=(FONT_BODY, 10), text_color=C.INK_DIM).pack(side="right")
+        elif t["status"] != "needs_more_questions":
+            ghost_button(row, "Start", lambda t=t: start_target(app, t), width=70).pack(side="right")
+    app._plan_card = targets[:limit]
+    return c
+
+
+def view_plan(app, parent):
+    conn = app.conn
+    wrap = _v95_page(app, parent, "Where to aim", "What the evidence points to, what to do about each, and what will "
+                     "count as fixed. Each target is checked later with questions you haven't seen.")
+    targets = refresh_targets(conn)
+    app._plan_view = targets
+    if not targets:
+        _v95_label(wrap, "Nothing stands out right now. Keep going with Today's session.", dim=True)
+    for t in targets:
+        c = card(wrap)
+        c.pack(fill="x", pady=(0, 10))
+        i = ctk.CTkFrame(c, fg_color="transparent")
+        i.pack(fill="x", padx=16, pady=12)
+        _v95_label(i, t["title"], bold=True, size=13)
+        _v95_label(i, STATUS_WORDS[t["status"]] + (f"  \u00b7  came back {t['relapses']} time"
+                                                   + ("s" if t["relapses"] != 1 else "") if t["relapses"] else ""),
+                   dim=True, size=11)
+        _v95_label(i, "What the app saw", bold=True, size=11, pady=(8, 0))
+        for line in t["evidence"]:
+            _v95_label(i, "\u2022 " + line, size=11)
+        _v95_label(i, "What to do", bold=True, size=11, pady=(6, 0))
+        _v95_label(i, PRESCRIPTION_WORDS.get(t["prescription"], "") + f" About {t['dose']} minutes.", size=11)
+        if t["randomized"]:
+            _v95_label(i, "This is one of two activities being compared for this kind of target.", dim=True, size=10)
+        _v95_label(i, "What will count as fixed", bold=True, size=11, pady=(6, 0))
+        _v95_label(i, t["fixed"].capitalize() + ".", size=11)
+        row = ctk.CTkFrame(i, fg_color="transparent")
+        row.pack(anchor="w", pady=(8, 0))
+        if proof_ready(t):
+            primary_button(row, "Check it", lambda t=t: check_target(app, t)).pack(side="left")
+        elif t["status"] == "proof_due":
+            _v95_label(row, "Ready to check tomorrow, so the check is spaced from the practice.", dim=True, size=11)
+        elif t["status"] == "needs_more_questions":
+            _v95_label(row, "There aren't new questions on this skill to check it with yet. The personal question "
+                            "bank can add some.", dim=True, size=11)
+        else:
+            primary_button(row, "Start" if t["status"] == "open" else "Continue", lambda t=t: start_target(app, t)).pack(side="left")
+        ghost_button(row, "Not now", lambda t=t: (conn.execute("UPDATE targets SET status='expired' WHERE key=?", (t["key"],)),
+                                                  _target_event(conn, t["key"], "dismissed"), conn.commit(),
+                                                  app.show_view("plan"))).pack(side="left", padx=(8, 0))
+
+
+# ---- standing catalogue: V10 ----------------------------------------------------------------------------------
+
+def _v10_seed_misses(conn, sid, n=2, confident=True, days_ago=3):
+    qs = items_for_skill(sid)[:n]
+    ts = (datetime.now() - timedelta(days=days_ago)).isoformat()
+    for q in qs:
+        conn.execute("INSERT INTO attempts (question_id, topic_id, correct, mode, timestamp, confidence, time_taken) "
+                     "VALUES (?,?,?,?,?,?,?)", (q["id"], q["topic"], 0, "quiz", ts, 3 if confident else 1, 60))
+    conn.commit()
+    return [q["id"] for q in qs]
+
+
+def _v10_skill_with(n):
+    return next(s for s in sorted(SKILLS) if len(items_for_skill(s)) >= n)
+
+
+def _probe_v10_target_structure(conn, inject=False):
+    init_schema(conn)
+    sid = _v10_skill_with(4)
+    _v10_seed_misses(conn, sid, 2)
+    targets = refresh_targets(conn)
+    t = next((x for x in targets if x["type"] == "blind_spot" and x["skills"] == [sid]), None)
+    if t is None:
+        return False, "two confident misses on a skill do not create a target"
+    if inject:
+        t = dict(t, evidence=[])
+    if not t["evidence"] or not t["prescription"] or not t["fixed"] or not t["title"]:
+        return False, "a target lacks its evidence, prescription or proof criterion"
+    text = json.dumps([x["title"] for x in targets] + [l for x in targets for l in x["evidence"]])
+    if VIS_FORBIDDEN.search(text) or UNOBSERVED_CLAIM.search(text) or VIS_PREDICTIVE.search(text):
+        return False, "target text carries decimals, percentages, predictions or claimed causes"
+    if set(t["reserve"]) & set(t["items"]):
+        return False, "proof questions overlap the treatment questions"
+    return True, "targets carry observed evidence, a prescription and a proof criterion, in words, with a separate proof reserve"
+
+
+def _probe_v10_priority(conn, inject=False):
+    a = {"type": "blind_spot", "skills": ["x"], "items": ["1", "2", "3", "4"], "count": 4}
+    b = {"type": "pace", "skills": ["x"], "items": ["1", "2", "3", "4"], "count": 4}
+    pa, ca = target_priority(a, days_left=60, content_pressing=True)
+    pb, cb = target_priority(b, days_left=60, content_pressing=True)
+    if inject:
+        pb = pa + 1
+    if not pa > pb or cb["phasing"] != 0.6:
+        return False, "pace work is not placed after content repair while content problems are pressing"
+    pb_close, cb_close = target_priority(b, days_left=7, content_pressing=True)
+    if cb_close["phasing"] != 1.0:
+        return False, "the content-before-pace rule still applies with the exam a week away"
+    again, _ = target_priority(a, days_left=60, content_pressing=True)
+    if again != pa or any(k not in ca for k in ("severity", "breadth", "consequence", "urgency", "evidence", "dose")):
+        return False, "priority is not deterministic or does not record its components"
+    f = {"type": "fading", "skills": [f"s{k}" for k in range(21)], "items": [], "count": 21}
+    bs3 = {"type": "blind_spot", "skills": ["x"], "items": ["1", "2", "3"], "count": 3}
+    if target_priority(f, 60)[0] >= target_priority(bs3, 60)[0]:
+        return False, "routine review of many due skills outranks three confident misses"
+    return True, "deterministic, explained by components; confident misses outrank routine upkeep; content before pace unless the exam is close"
+
+
+def _probe_v10_proof(conn, inject=False):
+    init_schema(conn)
+    sid = _v10_skill_with(5)
+    _v10_seed_misses(conn, sid, 2)
+    refresh_targets(conn)
+    key = f"blind_spot|{sid}"
+    row = conn.execute("SELECT reserve, items FROM targets WHERE key=?", (key,)).fetchone()
+    reserve = json.loads(row[0])
+    if len(reserve) < 2:
+        return True, "not enough unseen questions on the probe skill to test proof"
+    started = (datetime.now() - timedelta(days=3)).isoformat()
+    conn.execute("UPDATE targets SET status='in_treatment', started_at=? WHERE key=?", (started, key))
+    q0, q1 = QUIZ_BANK[reserve[0]], QUIZ_BANK[reserve[1]]
+    same_day = (datetime.now() - timedelta(days=1)).isoformat()
+    for q in (q0, q1):
+        conn.execute("INSERT INTO attempts (question_id, topic_id, correct, mode, timestamp, confidence) VALUES (?,?,?,?,?,?)",
+                     (q["id"], q["topic"], 1, "quiz", same_day, 3))
+    conn.commit()
+    refresh_targets(conn)
+    if conn.execute("SELECT status FROM targets WHERE key=?", (key,)).fetchone()[0] == "proven":
+        return False, "two right answers on the same day counted as proof"
+    conn.execute("UPDATE attempts SET timestamp=? WHERE question_id=?", ((datetime.now() - timedelta(days=2)).isoformat(), q1["id"]))
+    conn.execute("UPDATE attempts SET mode=? WHERE question_id=?", ("practice_only" if not inject else "quiz", q0["id"]))
+    conn.commit()
+    refresh_targets(conn)
+    if conn.execute("SELECT status FROM targets WHERE key=?", (key,)).fetchone()[0] == "proven":
+        return False, "an answer that did not count as measurement was used as proof"
+    conn.execute("UPDATE attempts SET mode='quiz' WHERE question_id=?", (q0["id"],))
+    conn.commit()
+    refresh_targets(conn)
+    if conn.execute("SELECT status FROM targets WHERE key=?", (key,)).fetchone()[0] != "proven":
+        return False, "two new questions answered right on different days, one confidently, do not prove the target"
+    miss = next(q for q in items_for_skill(sid) if q["id"] not in reserve)
+    conn.execute("INSERT INTO attempts (question_id, topic_id, correct, mode, timestamp, confidence) VALUES (?,?,?,?,?,?)",
+                 (miss["id"], miss["topic"], 0, "quiz", (datetime.now() + timedelta(seconds=5)).isoformat(), 2))
+    conn.commit()
+    refresh_targets(conn)
+    st = conn.execute("SELECT status, relapses FROM targets WHERE key=?", (key,)).fetchone()
+    if st[0] != "open" or st[1] != 1:
+        return False, "a miss soon after proof does not reopen the target"
+    return True, "proof needs unseen questions, measurement-eligible answers, two days and a confident answer; relapse reopens"
+
+
+def _probe_v10_identified_choice(conn, inject=False):
+    import inspect
+    src = inspect.getsource(choose_prescription) + inspect.getsource(refresh_targets)
+    if inject:
+        src += "select_intervention(conn, diagnosis)"
+    if "select_intervention" in src or "intervention_lift" in src:
+        return False, "activities are chosen from observational lift, which favours whatever was given to easier cases"
+    for t, spec in TARGET_TYPES.items():
+        if len(spec["arms"]) == 2:
+            trial = BEHAVIOUR_TRIALS.get(f"target_{t}") or {}
+            if not trial.get("registered"):
+                return False, f"the {t} activity comparison bypasses the ethics gate"
+    init_schema(conn)
+    init_behaviour_schema(conn)
+    t = {"type": "confusable_pair", "key": "confusable_pair|a,b", "skills": ["a", "b"]}
+    rx, arm = choose_prescription(conn, t)
+    occ = conn.execute("SELECT arm, propensity FROM behaviour_occasions WHERE name='target_confusable_pair' AND key=?",
+                       (t["key"],)).fetchone()
+    if arm is None or occ is None or occ[1] is None:
+        return False, "a randomized activity choice is not logged with its propensity"
+    rx2, _ = choose_prescription(conn, t)
+    if rx2 != rx:
+        return False, "the same target is assigned a different activity on a second look"
+    return True, "two plausible activities are assigned at random with a logged propensity, stable per target, through the gate"
+
+
+def _probe_v10_gentle(conn, inject=False):
+    import inspect
+    src = inspect.getsource(render_plan_card)
+    if inject:
+        src = src.replace('gentle_state(conn)["active"]', "False")
+    if 'gentle_state(conn)["active"]' not in src:
+        return False, "the plan ignores a gentle restart"
+    if "[:1]" not in src:
+        return False, "a gentle restart does not cut the plan to one short target"
+    return True, "during a gentle restart the plan shows at most one short target"
+
+
+def _probe_v10_proof_items_clean(conn, inject=False):
+    init_schema(conn)
+    init_provenance_schema(conn)
+    sid = _v10_skill_with(4)
+    items = [q["id"] for q in items_for_skill(sid)]
+    record_exposure(conn, items[0], "tutor_contrast", answer=True)
+    conn.execute("INSERT INTO attempts (question_id, topic_id, correct, mode, timestamp) VALUES (?,?,?,?,?)",
+                 (items[1], SKILLS[sid]["topic"], 1, "quiz", datetime.now().isoformat()))
+    conn.commit()
+    got = eligible_unseen_items(conn, sid)
+    if inject:
+        got = got + [items[0]]
+    if items[0] in got or items[1] in got:
+        return False, "proof questions include one already attempted or whose answer was shown"
+    return True, "proof questions are never attempted before and never had their answer shown"
+
+
+for _name, _spec in (
+    ("v10_target_without_proof", {"title": "A plan that says what but not how you'll know",
+        "failure_class": "Targets without observed evidence, a concrete activity or a criterion for fixed; proof questions reused from practice.",
+        "invariant": "Evidence, prescription and proof criterion in words; a separate proof reserve.",
+        "found_in": "V10, from the earlier plan, cluster diagnosis and skill dossier.", "probe": _probe_v10_target_structure}),
+    ("v10_priority_opaque", {"title": "A ranking nobody can explain",
+        "failure_class": "Priorities that change run to run, hide their reasons, or send pace work ahead of broken content.",
+        "invariant": "Deterministic, componentwise, content before pace unless the exam is close.",
+        "found_in": "V10, with the earlier plan's phasing rule.", "probe": _probe_v10_priority}),
+    ("v10_fixed_by_assertion", {"title": "Calling a problem fixed too early",
+        "failure_class": "Same-day, non-measurement or reused questions counted as proof; no relapse check.",
+        "invariant": "Unseen, eligible, two days, a confident answer; relapse reopens.",
+        "found_in": "V10.", "probe": _probe_v10_proof}),
+    ("v10_confounded_treatment_choice", {"title": "Picking what worked from confounded history",
+        "failure_class": "Choosing activities by observed lift, which reflects which cases each was given.",
+        "invariant": "Randomized assignment with logged propensity, stable per target, through the ethics gate.",
+        "found_in": "V10, correcting the earlier select_intervention.", "probe": _probe_v10_identified_choice}),
+    ("v10_plan_overloads_hard_day", {"title": "A long plan on a hard day",
+        "failure_class": "Showing several targets during a gentle restart.",
+        "invariant": "At most one short target while gentle.", "found_in": "V10.", "probe": _probe_v10_gentle}),
+    ("v10_proof_on_seen_questions", {"title": "Checking with questions already seen",
+        "failure_class": "Proof reserve including attempted or answer-exposed questions.",
+        "invariant": "Proof questions are unseen and unexposed.", "found_in": "V10.", "probe": _probe_v10_proof_items_clean}),
+):
+    register_adversarial_class(_name, _spec)
+
+for _a, _b in (("target_blind_spot", "target_confusable_pair"), ("target_blind_spot", "target_shared_idea"),
+               ("target_confusable_pair", "target_shared_idea")):
+    TRIAL_OVERLAPS[(_a, _b)] = ("Mutually exclusive occasions: each target has exactly one type, so no target is "
+                                "assigned in two of these comparisons. Skills can overlap across targets; analyse "
+                                "by target, not by skill.")
+TRIAL_OVERLAPS[("explain_before_reveal", "target_blind_spot")] = (
+    "Sessions started from a target with the explanation activity always ask for explanations and log no "
+    "explain_before_reveal occasion, so that trial's randomization is not contaminated.")
+
+DEPTH_REGIONS["today"] = tuple(list(DEPTH_REGIONS["today"][:4]) + [("plan", "Standard")] + list(DEPTH_REGIONS["today"][4:]))
+VIEW_MAP.update({"plan": view_plan})
+NAV_HIGHLIGHT.update({"plan": "insights"})
+seal_behaviour_registry()
 
 
 def main():
