@@ -4,7 +4,7 @@
 
 | Path | What it is |
 |---|---|
-| `src/nj_re_trainer_gui_V9_3.py` | The application |
+| `src/recursa_app.py` | The application |
 | `recursa_launcher.py` | Entry point, with `--selfcheck`, `--smoke-test` and `--report=PATH` |
 | `recursa.spec` | PyInstaller build (one folder; `.app` on macOS) |
 | `requirements-build.txt` | Pinned packages (Python 3.12) |
@@ -20,14 +20,14 @@
 
 | Trigger | Result |
 |---|---|
-| Push to `main`, a pull request, or **Run workflow** by hand | Builds on Windows x64, macOS Apple silicon (`macos-15`) and macOS Intel (`macos-15-intel`). Every build runs the frozen app's 89-class self-check and a window smoke test. Builds are kept as artifacts for 14 days. |
-| Pushing a tag like `v9.3.0` | Also builds the Windows installer and portable zip and a `.dmg` per Mac chip, signs them if secrets are set, writes `SHA256SUMS.txt`, and publishes a GitHub Release. |
+| Push to `main`, a pull request, or **Run workflow** by hand | Builds on Windows x64, macOS Apple silicon (`macos-15`) and macOS Intel (`macos-15-intel`). Every build runs the frozen app's 96-class self-check and a window smoke test. Builds are kept as artifacts for 14 days. |
+| Pushing a tag like `v9.4.0` | Also builds the Windows installer and portable zip and a `.dmg` per Mac chip, signs them if secrets are set, writes `SHA256SUMS.txt`, and publishes a GitHub Release. |
 
 To make a release:
 
 ```bash
-git tag v9.3.0
-git push origin v9.3.0
+git tag v9.4.0
+git push origin v9.4.0
 ```
 
 **Intel Macs:** `macos-15-intel` is GitHub's last Intel image, available until August 2027. After that, drop the Intel leg or build Intel copies on your own Mac.
@@ -54,7 +54,7 @@ The signing scripts have not been run against real certificates. Expect to adjus
 
 ## What was verified before this repository was handed over
 - **Linux build from this exact layout** (Python 3.12.3, PyInstaller 6.22.3):
-  - the frozen app passes all 89 self-check classes, including probes that read the app's own source;
+  - the frozen app passes all 96 self-check classes, including probes that read the app's own source;
   - the smoke test opens Today, Map, Practice, Insights and Settings;
   - a normal launch creates the learner database.
 - **Workflow:** lints clean with actionlint. The only flag was the `macos-15-intel` label, which is newer than that actionlint release.

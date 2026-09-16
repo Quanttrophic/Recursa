@@ -10556,11 +10556,12 @@ def update_learner_phase(conn, completed=True):
     set_setting(conn, "phase_demote_pending", "1" if demote_now else "0")
 
     new = phase
-    if dwell < min_dwell:
-        return phase
-    # Re-entry to A (from anywhere) -- only on the second consecutive evaluation
+    # V9.4: safety before dwell. Re-entry to Entry needs two consecutive
+    # evaluations, not banked completions: abandonment never banks one.
     if demote_now and demote_pending and phase != "A":
         new = "A"
+    elif dwell < min_dwell:
+        return phase
     elif phase == "A":
         if (n_complete >= b_min_sessions and abandons_7 <= 1
                 and len(last3) == 3 and all(last3)):
@@ -32386,6 +32387,11 @@ class QuestionSession:
         except Exception:
             pass
         session_context_end(self)
+        if getattr(self, "_calm_key", None) is not None:
+            try:
+                record_behaviour_outcome(self.conn, "calm_timer", self._calm_key, 0.0)   # abandoned
+            except Exception:
+                pass
         try:
             record_session_affect(self.conn, abandoned=True, session_key=getattr(self, "session_uuid", None))
         except Exception as e:
@@ -32487,7 +32493,7 @@ class QuestionSession:
         if not hasattr(self, "_calm"):
             self._calm = calm_timer_arm(self)       # V8.5 trial, assigned once per session
         if lbl_alive:
-            text, color = timer_display(remaining, self._calm)
+            text, color = timer_display(remaining, self._calm, exam=bool(getattr(self, "exam_mode", False)))
             try:
                 self.timer_lbl.configure(text=text, text_color=color)
                 self._update_pacing(elapsed)
@@ -32525,7 +32531,7 @@ class QuestionSession:
             msg = f"{int(behind // 60)}m {int(behind % 60)}s behind"
             if behind > 180:
                 msg += " \u2014 consider guessing and moving on"
-            self.pace_lbl.configure(text=msg, text_color=(C.INK if getattr(self, "_calm", False) else C.STAMP))
+            self.pace_lbl.configure(text=msg, text_color=(C.STAMP if getattr(self, "exam_mode", False) else C.INK))
 
     def toggle_flag(self):
         if self.index in self.flagged:
@@ -32687,10 +32693,6 @@ class QuestionSession:
             record_session_affect(self.conn, _aff, abandoned=False, session_key=summary.get("session_uuid"))
         except Exception as e:
             _audit(self.conn, "session_affect_failed", f"{type(e).__name__}: {e}")
-        try:
-            settle_retest_deadline_outcomes(self.conn)
-        except Exception as e:
-            _audit(self.conn, "retest_deadline_settle_failed", f"{type(e).__name__}: {e}")
         try:
             model_drift_check(self.conn)
         except Exception as e:
@@ -40575,6 +40577,9 @@ def view_today(app, parent):
     except Exception:
         ls = learner_state(blank_inferred_state())
     vs = gather_visual_state(conn)
+    _depth = view_depth(conn, "today")
+    _show = set(blocks_for("today", _depth))
+    depth_control(wrap, app, "today").pack(anchor="e", pady=(0, 2))
     hl = ctk.CTkLabel(wrap, text=ls["headline"], font=(FONT_DISPLAY, 22, "bold"), text_color=C.INK,
                       anchor="w", justify="left")
     hl.pack(anchor="w", fill="x", pady=(0, 6))
@@ -40643,7 +40648,8 @@ def view_today(app, parent):
         ctk.CTkLabel(inner, text=f"~{plan['est_minutes']} minutes · {count_txt} · untimed"
                      + (f" · focus: {ls['focus']}" if ls["focus"] else ""),
                      font=(FONT_BODY, 12), text_color=C.CREAM, anchor="w").pack(anchor="w", pady=(2, 4))
-        vis_draw_trajectory(inner, trajectory, reduced=reduced, dark=True)
+        if "session_structure" in _show:
+            vis_draw_trajectory(inner, trajectory, reduced=reduced, dark=True)
         stage_names = " \u2192 ".join(s["title"] for s in trajectory)
 
         def start(plan=plan, count_txt=count_txt, stage_names=stage_names):
@@ -40677,7 +40683,7 @@ def view_today(app, parent):
         primary_button(inner, "Begin", start).pack(anchor="w")
 
     # ---- the one adaptive region, in a fixed place ----
-    if total_attempts and diag is not None:
+    if total_attempts and diag is not None and "suggestions" in _show:
         try:
             vis_suggestion_strip(app, wrap, vs)
         except Exception as e:
@@ -40744,6 +40750,9 @@ def view_today(app, parent):
         rl.pack(anchor="w", fill="x")
         bind_autowrap(rl, wi, padding=8)
 
+    if "why_chosen" not in _show:
+        wc.destroy()
+
     # ---- map, in motion, next milestone ----
     row = ctk.CTkFrame(wrap, fg_color="transparent")
     row.pack(fill="x", pady=(0, 14))
@@ -40762,6 +40771,11 @@ def view_today(app, parent):
     ctk.CTkLabel(ic, text="In motion", font=(FONT_BODY, 13, "bold"), text_color=C.INK,
                  anchor="w").pack(anchor="w", padx=14, pady=(10, 2))
     vis_in_motion(ic, app, vs)
+    if "in_motion" not in _show:
+        ic.destroy()
+        mc.grid_configure(columnspan=2, padx=0)
+    if "mini_map" not in _show:
+        row.destroy()
 
     lc = card(wrap, fg_color=C.PAPER)
     lc.pack(fill="x", pady=(0, 10))
@@ -40774,6 +40788,8 @@ def view_today(app, parent):
         ctk.CTkLabel(lh, text=f"{nxt['label']}: {nxt['condition']}", font=(FONT_BODY, 11),
                      text_color=C.INK_DIM, anchor="w", justify="left", wraplength=520).pack(side="left", padx=(10, 0))
     LadderPath(lc, app, path, [], compact=True).pack(fill="x", padx=10, pady=(0, 8))
+    if "next_milestone" not in _show:
+        lc.destroy()
 
     erow = ctk.CTkFrame(wrap, fg_color="transparent")
     erow.pack(fill="x", pady=(6, 0))
@@ -40814,7 +40830,7 @@ def view_today(app, parent):
             nbb = "Open"
         ghost_button(nbi, nbb, lambda: app.show_view("exameve"), width=80).pack(anchor="w", pady=(8, 0))
 
-    if ls["pressure_line"]:
+    if ls["pressure_line"] and "pace_line" in _show:
         pl = ctk.CTkLabel(wrap, text=ls["pressure_line"], font=(FONT_BODY, 12, "italic"),
                           text_color=C.INK_DIM, anchor="w", justify="left")
         pl.pack(anchor="w", fill="x", pady=(12, 0))
@@ -43719,22 +43735,20 @@ def present_week(conn, today=None):
         f"{_pl(retests, 'confident miss', 'confident misses')} revisited" if retests else None,
         f"{_plural(reviews, 'review')} done" if reviews else None,
         f"{_plural(repairs, 'repair')} closed after a later check" if repairs else None) if x]
-    days = []
     try:
         active = {r["d"] for r in _safe_query(
             conn, "SELECT DISTINCT substr(timestamp,1,10) d FROM attempts WHERE substr(timestamp,1,10) >= ?",
             (start,))}
     except Exception:
         active = set()
-    for i in range(7):
-        d = today - timedelta(days=6 - i)
-        days.append({"day": d.strftime("%a"), "practised": d.isoformat() in active})
+    # V9.4: how many days had practice, never which days in a row.
+    practised_days = len(active)
     areas = set()
     for r in rows:
         if r["skill_id"] in SKILLS:
             areas.add(SKILLS[r["skill_id"]]["topic"])
     return {"movement": lines or ["Nothing has moved yet this week."],
-            "areas": len(areas), "days": days}
+            "areas": len(areas), "practised_days": practised_days}
 
 
 # ---- V8.3.1: one composer ------------------------------------------------------------
@@ -44256,7 +44270,7 @@ def vis_draw_node(cv, x, y, r, node, lod, tags=(), dim=False, focus=False, style
     if thin and style == "faded" and not dim:
         # Faded encoding: a lighter fill instead of the dashed halo (study-kit variant).
         saved = VIS_PALETTE["fill"]
-        VIS_PALETTE["fill"] = _blend_hex(saved, VIS_PALETTE.get("fill_track", C.PAPER), 0.55)
+        VIS_PALETTE["fill"] = _blend_hex(saved, VIS_PALETTE.get("fill_track", C.PAPER), FADED_BLEND)
         try:
             vis_draw_glyph(cv, x, y, r, node["coarse_glyph"], (), tags=tags, dim=dim, focus=focus)
         finally:
@@ -44419,9 +44433,11 @@ class CourseMap(ctk.CTkFrame):
     demand, and an inspector that docks or slides over by width."""
 
     def __init__(self, parent, app, vs=None, compact=False, height=520, on_navigate=None,
-                 persist=True):
+                 persist=True, depth="Standard"):
         super().__init__(parent, fg_color="transparent")
         self.app, self.conn, self.compact = app, app.conn, compact
+        self.depth = depth if depth in DEPTH_ORDER else "Standard"
+        self.show = set(blocks_for("map", self.depth))
         self.vs = vs if vs is not None else gather_visual_state(self.conn)
         self.domains = {d["tid"]: d for d in present_course_map(self.vs)}
         self.nodes = {n["sid"]: n for d in self.domains.values() for n in d["nodes"]}
@@ -44455,16 +44471,19 @@ class CourseMap(ctk.CTkFrame):
             ctk.CTkLabel(right, text="Find a skill", font=(FONT_BODY, 10), text_color=C.INK_DIM).pack(side="left", padx=(0, 10))
             self.flt_var = ctk.StringVar(value="All")
             row_f = ctk.CTkFrame(self, fg_color="transparent")
-            row_f.pack(fill="x", pady=(0, 4))
+            if "filters" in self.show:
+                row_f.pack(fill="x", pady=(0, 4))
             ctk.CTkLabel(row_f, text="Show:", font=(FONT_BODY, 10), text_color=C.INK_DIM).pack(side="left")
             ctk.CTkSegmentedButton(row_f, values=list(VIS_MAP_FILTERS), variable=self.flt_var,
                                    command=self._set_filter).pack(side="left", padx=(4, 0))
             row2 = ctk.CTkFrame(self, fg_color="transparent")
             row2.pack(fill="x", pady=(0, 4))
-            ctk.CTkLabel(row2, text="Links:", font=(FONT_BODY, 10), text_color=C.INK_DIM).pack(side="left")
             self.edge_var = ctk.StringVar(value=self.edge_mode)
-            ctk.CTkSegmentedButton(row2, values=list(VIS_EDGE_MODES), variable=self.edge_var,
-                                   command=self._set_edges).pack(side="left", padx=(4, 12))
+            if "links_control" in self.show:
+                ctk.CTkLabel(row2, text="Links:", font=(FONT_BODY, 10), text_color=C.INK_DIM).pack(side="left")
+                ctk.CTkSegmentedButton(row2, values=[m for m in VIS_EDGE_MODES
+                                                     if m != "All" or "all_links" in self.show],
+                                       variable=self.edge_var, command=self._set_edges).pack(side="left", padx=(4, 12))
             # A native ttk control, so the accessible list is itself reachable by
             # assistive technology that reads Tk widgets. Alt+L from anywhere.
             self.mirror_btn = ttk.Button(row2, text="List view (Alt+L)", command=self.toggle_mirror)
@@ -44513,6 +44532,13 @@ class CourseMap(ctk.CTkFrame):
             self.cv.bind(key, fn)
         if self.persist:
             self._restore_state()
+        # Depth sets the ceiling on what the map shows (V9.4).
+        if self.edge_mode == "All" and "all_links" not in self.show:
+            self.edge_mode = "On selection"
+        if "links_on_selection" not in self.show:
+            self.edge_mode = "Off"
+        if "filters" not in self.show:
+            self.flt = "All"
         if not compact and vis_accessible_mode(self.conn) and (self.mirror is None or not self.mirror.winfo_ismapped()):
             self.after_idle(lambda: (self.mirror is None or not self.mirror.winfo_ismapped()) and self.toggle_mirror())
         self._render_crumbs()
@@ -44660,6 +44686,8 @@ class CourseMap(ctk.CTkFrame):
                 vis_announce(self.app, text)
 
     def start_compare(self):
+        if "compare_mode" not in self.show:
+            return "break"
         if not self.sid:
             self._banner("Choose a skill first, then compare.")
             return "break"
@@ -44689,7 +44717,7 @@ class CourseMap(ctk.CTkFrame):
             self.on_navigate(tid, sid)
             return
         self._push()
-        if (shift or self.compare_pending) and self.sid and self.sid != sid:
+        if (shift or self.compare_pending) and "compare_mode" in self.show and self.sid and self.sid != sid:
             self.compare_sid = sid
             self.compare_pending = False
             self._banner("")
@@ -44924,7 +44952,9 @@ class CourseMap(ctk.CTkFrame):
             r = 15
             sel = sid in (self.sid, self.compare_sid)
             match = vis_node_matches(n, self.flt)
-            vis_draw_node(self.cv, x, y, r, n, "domain", dim=not match,
+            vis_draw_node(self.cv, x, y, r, n if "evidence_overlays" in self.show else dict(
+                              n, overlays=[o for o in n["overlays"] if o not in ("little_evidence", "mixed_evidence")]),
+                          "domain", dim=not match,
                           focus=(self.kb and idx == self.focus_idx), style=uncertainty_style(self.conn, self.app))
             if sel:
                 self.cv.create_oval(x - r - 11, y - r - 11, x + r + 11, y + r + 11, outline=C.BRASS, width=3)
@@ -45110,17 +45140,18 @@ class CourseMap(ctk.CTkFrame):
         head.pack(anchor="w", padx=12, pady=(10, 0))
         # The inspector is the one place the full eight-tier vocabulary is drawn.
         vis_draw_glyph(head, 24, 27, 16, n["glyph"], [o for o in n["overlays"] if o == "little_evidence"])
-        head.create_text(54, 16, anchor="w", text=n["tier"], font=(FONT_BODY, 13, "bold"), fill=C.INK)
+        head.create_text(54, 16, anchor="w", text=(n["tier"] if "inspector_tier_word" in self.show else n["coarse"]),
+                         font=(FONT_BODY, 13, "bold"), fill=C.INK)
         head.create_text(54, 36, anchor="w", text=n["next"], font=(FONT_BODY, 10), fill=C.INK_DIM)
         self._panel_text(n["label"], 12, bold=True, pady=(4, 0))
         if n["step"]:
             self._panel_text(n["step"], color=C.INK_DIM)
         for m in node_marks(n):
             self._panel_text(f"{MARK_SYMBOL[m]}  {MARK_TEXT[m]}", color=C.BRASS_DARK)
-        if "little_evidence" in n["overlays"]:
+        if "little_evidence" in n["overlays"] and "evidence_overlays" in self.show:
             self._panel_text(("Lighter fill" if uncertainty_style(self.conn, self.app) == "faded" else "Dashed halo")
                              + ": not much evidence yet", color=C.INK_DIM)
-        if "mixed_evidence" in n["overlays"]:
+        if "mixed_evidence" in n["overlays"] and "evidence_overlays" in self.show:
             self._panel_text("Dash-dot ring: results have been mixed lately, so it will come up again soon",
                              color=C.INK_DIM)
         pts = present_timeline(timeline, detail)
@@ -45156,7 +45187,8 @@ class CourseMap(ctk.CTkFrame):
                     width=160).pack(anchor="w", pady=(2, 0))
             for lab in pre:
                 self._panel_text("Builds on: " + lab, color=C.INK_DIM)
-        ghost_button(self.panel, "Compare with another skill", self.start_compare).pack(anchor="w", padx=12, pady=(12, 2))
+        if "compare_mode" in self.show:
+            ghost_button(self.panel, "Compare with another skill", self.start_compare).pack(anchor="w", padx=12, pady=(12, 2))
         primary_button(self.panel, "Practise this skill",
                        lambda: vis_start_practice(self.app, self.app.content,
                                                   [sid] + [c["other"] for c in confs[:1]],
@@ -45582,7 +45614,8 @@ def view_map(app, parent):
     wrap.pack(fill="both", expand=True, padx=28, pady=22)
     section_title(wrap, "Map", "Every exam area and skill, in the same place every time. "
                   "Click an area to open it, a skill to ask about it.").pack(anchor="w", fill="x", pady=(0, 10))
-    cm = CourseMap(wrap, app, height=560)
+    depth_control(wrap, app, "map").pack(anchor="e", pady=(0, 4))
+    cm = CourseMap(wrap, app, height=560, depth=view_depth(app.conn, "map"))
     cm.pack(fill="both", expand=True)
     focus = getattr(app, "_map_focus", None)
     app._map_focus = None
@@ -45596,13 +45629,21 @@ def view_practice(app, parent):
     conn = app.conn
     wrap = ctk.CTkScrollableFrame(parent, fg_color="transparent")
     wrap.pack(fill="both", expand=True, padx=28, pady=22)
+    depth_control(wrap, app, "practice").pack(anchor="e", pady=(0, 2))
     section_title(wrap, "Practice", "The timed ladder, what is waiting for you, and every tool.").pack(
         anchor="w", fill="x", pady=(0, 12))
     vs = gather_visual_state(conn)
-    ctk.CTkLabel(wrap, text="The ladder", font=(FONT_BODY, 13, "bold"), text_color=C.INK,
-                 anchor="w").pack(anchor="w")
-    LadderPath(wrap, app, present_ladder_path(ladder_rungs(conn)), present_closest_to_unlock(vs)).pack(
-        fill="x", pady=(4, 16))
+    _show = set(blocks_for("practice", view_depth(conn, "practice")))
+    _path = present_ladder_path(ladder_rungs(conn))
+    _next = next((p for p in _path if p["state"] == "locked"), None)
+    ctk.CTkLabel(wrap, text=(f"Next on the ladder: {_next['label']}. {_next['condition']}" if _next
+                             else "Every rung of the ladder is open."),
+                 font=(FONT_BODY, 12), text_color=C.INK, anchor="w", justify="left",
+                 wraplength=640).pack(anchor="w", pady=(0, 10))
+    if "ladder" in _show:
+        ctk.CTkLabel(wrap, text="The ladder", font=(FONT_BODY, 13, "bold"), text_color=C.INK,
+                     anchor="w").pack(anchor="w")
+        LadderPath(wrap, app, _path, present_closest_to_unlock(vs)).pack(fill="x", pady=(4, 16))
     waiting = []
     if vs["repairs"]:
         waiting.append(("Repairs in progress", f"{_plural(len(vs['repairs']), 'mix-up')} being fixed, "
@@ -45614,7 +45655,7 @@ def view_practice(app, parent):
     if any(vs["tiers"].get(s) in (TIER_STEADY, TIER_STRONG, TIER_READY_FOR_SIMULATION)
            for s in vis_skills_of("t10")):
         waiting.append(("Transfer check", "Maths you have got right, with the numbers changed.", "transfer"))
-    if waiting:
+    if waiting and "waiting" in _show:
         ctk.CTkLabel(wrap, text="Waiting for you", font=(FONT_BODY, 13, "bold"), text_color=C.INK,
                      anchor="w").pack(anchor="w", pady=(0, 4))
         for title, text, key in waiting:
@@ -45627,11 +45668,13 @@ def view_practice(app, parent):
                          anchor="w").pack(anchor="w")
             ctk.CTkLabel(inner, text=text, font=(FONT_BODY, 11), text_color=C.INK_DIM, anchor="w",
                          justify="left", wraplength=560).pack(anchor="w")
-    ctk.CTkLabel(wrap, text="Tools", font=(FONT_BODY, 13, "bold"), text_color=C.INK,
-                 anchor="w").pack(anchor="w", pady=(12, 4))
+    if "tools" in _show:
+        ctk.CTkLabel(wrap, text="Tools", font=(FONT_BODY, 13, "bold"), text_color=C.INK,
+                     anchor="w").pack(anchor="w", pady=(12, 4))
     grid = ctk.CTkFrame(wrap, fg_color="transparent")
     grid.pack(fill="x")
-    tools = [t for t in WORKSHOP_TOOLS if t[0] not in ("learnermodel", "loop")]
+    tools = ([t for t in WORKSHOP_TOOLS if t[0] not in ("learnermodel", "loop") or "model_views" in _show]
+             if "tools" in _show else [])
     for i, (key, label, blurb) in enumerate(tools):
         r, col = divmod(i, 3)
         grid.columnconfigure(col, weight=1, uniform="tools")
@@ -45643,7 +45686,14 @@ def view_practice(app, parent):
         bl = ctk.CTkLabel(c, text=blurb, font=(FONT_BODY, 10), text_color=C.INK_DIM, anchor="w",
                           justify="left", wraplength=200)
         bl.pack(anchor="w", fill="x", padx=12, pady=(0, 10))
-    what_else_helps_disclosure(wrap)
+    if "pace_words" in _show:
+        ctk.CTkLabel(wrap, text="Pace or knowledge", font=(FONT_BODY, 13, "bold"), text_color=C.INK,
+                     anchor="w").pack(anchor="w", pady=(12, 2))
+        for _ln in present_pace_words(conn):
+            ctk.CTkLabel(wrap, text=_ln, font=(FONT_BODY, 11), text_color=C.INK, anchor="w", justify="left",
+                         wraplength=640).pack(anchor="w")
+    if "what_else_helps" in _show:
+        what_else_helps_disclosure(wrap)
 
 
 EVENT_SYMBOL = {"moved": "\u2197", "review_cleared": "\u2713", "ready": "\u25ce", "step": "\u25cf",
@@ -45781,8 +45831,10 @@ def view_insights(app, parent):
     conn = app.conn
     wrap = ctk.CTkScrollableFrame(parent, fg_color="transparent")
     wrap.pack(fill="both", expand=True, padx=28, pady=22)
+    depth_control(wrap, app, "insights").pack(anchor="e", pady=(0, 2))
     section_title(wrap, "Insights", "What moved, how your confidence tracks, and why the app thinks what it does.").pack(
         anchor="w", fill="x", pady=(0, 12))
+    _show = set(blocks_for("insights", view_depth(conn, "insights")))
     wk = present_week(conn)
     c0 = card(wrap)
     c0.pack(fill="x", pady=(0, 10))
@@ -45791,17 +45843,11 @@ def view_insights(app, parent):
     ctk.CTkLabel(i0, text="This week", font=(FONT_BODY, 13, "bold"), text_color=C.INK, anchor="w").pack(anchor="w")
     for ln in wk["movement"]:
         ctk.CTkLabel(i0, text=ln, font=(FONT_BODY, 12), text_color=C.INK, anchor="w").pack(anchor="w")
-    dcv = tk.Canvas(i0, height=38, width=320, bg=C.PAPER, highlightthickness=0)
-    dcv.pack(anchor="w", pady=(8, 0))
-    for i, d in enumerate(wk["days"]):
-        x = 16 + i * 44
-        if d["practised"]:
-            dcv.create_oval(x - 6, 6, x + 6, 18, fill=C.NAVY_3, outline="")
-        else:
-            dcv.create_oval(x - 6, 6, x + 6, 18, outline=C.PAPER_LINE, dash=(2, 2))
-        dcv.create_text(x, 30, text=d["day"], font=(FONT_BODY, 8), fill=C.INK_DIM)
-    ctk.CTkLabel(i0, text="Days with practice, for context. Movement is what counts.",
-                 font=(FONT_BODY, 10), text_color=C.INK_DIM, anchor="w").pack(anchor="w")
+    ctk.CTkLabel(i0, text=(f"Practised on {_plural(wk['practised_days'], 'day')} this week, for context. "
+                           "Movement is what counts."),
+                 font=(FONT_BODY, 10), text_color=C.INK_DIM, anchor="w").pack(anchor="w", pady=(6, 0))
+    if "week_movement" not in _show:
+        c0.destroy()
     try:
         events = json.loads(get_setting(conn, "last_session_changes", "") or "[]")
     except ValueError:
@@ -45830,17 +45876,32 @@ def view_insights(app, parent):
         txt = "Rate how sure you are after each answer, and this fills in."
     ctk.CTkLabel(i2, text=txt, font=(FONT_BODY, 11), text_color=C.INK, anchor="w", justify="left",
                  wraplength=640).pack(anchor="w", pady=(2, 0))
-    ctk.CTkLabel(wrap, text="Ask about any skill", font=(FONT_BODY, 13, "bold"), text_color=C.INK,
-                 anchor="w").pack(anchor="w", pady=(6, 2))
-    ctk.CTkLabel(wrap, text="Open an area, choose a skill, and ask why it stands where it does, what that is "
-                 "based on, and what would change it. Compare it with another from the skill panel.",
-                 font=(FONT_BODY, 11), text_color=C.INK_DIM, anchor="w", justify="left",
-                 wraplength=700).pack(anchor="w", pady=(0, 6))
-    CourseMap(wrap, app, height=440, persist=False).pack(fill="x")
-    row = ctk.CTkFrame(wrap, fg_color="transparent")
-    row.pack(anchor="w", pady=(12, 0))
-    ghost_button(row, "Disagree with the app", lambda: app.show_view("learnermodel")).pack(side="left", padx=(0, 8))
-    ghost_button(row, "What the app plans next", lambda: app.show_view("loop")).pack(side="left")
+    if "confidence" not in _show:
+        c2.destroy()
+    if "ask_about_skill" in _show:
+        ctk.CTkLabel(wrap, text="Ask about any skill", font=(FONT_BODY, 13, "bold"), text_color=C.INK,
+                     anchor="w").pack(anchor="w", pady=(6, 2))
+        ctk.CTkLabel(wrap, text="Open an area, choose a skill, and ask why it stands where it does, what that is "
+                     "based on, and what would change it.",
+                     font=(FONT_BODY, 11), text_color=C.INK_DIM, anchor="w", justify="left",
+                     wraplength=700).pack(anchor="w", pady=(0, 6))
+        CourseMap(wrap, app, height=440, persist=False, depth=view_depth(conn, "insights")).pack(fill="x")
+    for _key, _title, _lines in (("mixups_seen", "Mix-ups seen lately", present_mixups_seen),
+                                 ("area_movement", "Movement by area", present_area_movement)):
+        if _key in _show:
+            _c = card(wrap)
+            _c.pack(fill="x", pady=(10, 0))
+            _i = ctk.CTkFrame(_c, fg_color="transparent")
+            _i.pack(fill="x", padx=16, pady=12)
+            ctk.CTkLabel(_i, text=_title, font=(FONT_BODY, 13, "bold"), text_color=C.INK, anchor="w").pack(anchor="w")
+            for _ln in _lines(conn):
+                ctk.CTkLabel(_i, text=_ln, font=(FONT_BODY, 11), text_color=C.INK, anchor="w", justify="left",
+                             wraplength=640).pack(anchor="w")
+    if "disagree" in _show:
+        row = ctk.CTkFrame(wrap, fg_color="transparent")
+        row.pack(anchor="w", pady=(12, 0))
+        ghost_button(row, "Disagree with the app", lambda: app.show_view("learnermodel")).pack(side="left", padx=(0, 8))
+        ghost_button(row, "What the app plans next", lambda: app.show_view("loop")).pack(side="left")
 
 
 # ---- navigation ------------------------------------------------------------------
@@ -46316,7 +46377,7 @@ def _probe_v83_week_movement_first(conn, inject=False):
     bad = [l for l in lines if re.search(r"streak|in a row of days|don't break|keep it up", l, re.I)]
     if bad or VIS_FORBIDDEN.search(" ".join(lines)):
         return False, f"the weekly view leads with activity or streak language: {bad[:1]}"
-    if "days" not in wk or wk.get("movement") is None:
+    if "practised_days" not in wk or wk.get("movement") is None:
         return False, "movement lines missing"
     return True, "the week leads with movement; activity is secondary context"
 
@@ -46989,7 +47050,7 @@ BEHAVIOUR_TRIALS["suggestion_strip"] = {
 CALM_TIMER_SECONDS_SHOWN = 300
 
 
-def timer_display(remaining, calm):
+def timer_display(remaining, calm, exam=False):
     """(text, colour) for the practice clock. Calm: whole minutes until the
     last five, then minutes and seconds; never red. Control: the V6 display."""
     remaining = max(0, int(remaining))
@@ -46999,7 +47060,10 @@ def timer_display(remaining, calm):
             m = int(math.ceil(remaining / 60.0))
             return f"\u23f1 about {m} min left", C.NAVY
         return f"\u23f1 {mins}:{secs:02d}", C.NAVY
-    return f"\u23f1 {mins}:{secs:02d}", (C.STAMP if remaining < 60 else C.NAVY)
+    if exam:
+        # The exam simulation keeps the real countdown it rehearses.
+        return f"\u23f1 {mins}:{secs:02d}", (C.STAMP if remaining < 60 else C.NAVY)
+    return f"\u23f1 {mins}:{secs:02d}", C.NAVY
 
 
 def calm_timer_arm(session):
@@ -47035,10 +47099,16 @@ def lookalike_outcome(later_rows, skill_id):
 
 def settle_question_screen_trials(session, summary):
     conn = session.conn
-    if getattr(session, "_calm_key", None) is not None and summary.get("total"):
+    if getattr(session, "_calm_key", None) is not None:
         try:
-            record_behaviour_outcome(conn, "calm_timer", session._calm_key,
-                                     summary.get("correct", 0) / float(summary["total"]))
+            # V9.4: the calm clock targets disruption, so its outcome is completion.
+            record_behaviour_outcome(conn, "calm_timer", session._calm_key, 1.0)
+            ans, init = summary.get("answers") or [], summary.get("initial_answers") or []
+            churn = sum(1 for a, b in zip(ans, init) if a is not None and b is not None and a != b)
+            conn.execute("CREATE TABLE IF NOT EXISTS timer_trial_details (key TEXT PRIMARY KEY, completed INTEGER, "
+                         "churn_items INTEGER)")
+            conn.execute("INSERT OR REPLACE INTO timer_trial_details VALUES (?,?,?)", (session._calm_key, 1, churn))
+            conn.commit()
         except Exception:
             pass
     for note in getattr(session, "_lookalike_notes", []):
@@ -47255,8 +47325,9 @@ def _probe_v85_calm_timer(conn, inject=False):
             return False, f"the calm clock turns red at {rem} seconds"
         if rem > CALM_TIMER_SECONDS_SHOWN and re.search(r"\d+:\d\d", text):
             return False, "the calm clock shows seconds before the last five minutes"
-    if timer_display(59, False)[1] != C.STAMP or timer_display(1800, False)[0] != "\u23f1 30:00":
-        return False, "the control arm no longer shows the original clock"
+    if (timer_display(59, False)[1] == C.STAMP or timer_display(1800, False)[0] != "\u23f1 30:00"
+            or timer_display(59, False, exam=True)[1] != C.STAMP):
+        return False, "a practice clock turns red, or the exam simulation lost its real countdown"
 
     class _S:
         timed, exam_mode, record_mode, _attempt_id_at_start = True, True, "exam", 1
@@ -47266,7 +47337,7 @@ def _probe_v85_calm_timer(conn, inject=False):
     import inspect
     if "settle_question_screen_trials" not in inspect.getsource(QuestionSession.finish):
         return False, "the trial outcome is never recorded"
-    return True, "calm arm: minutes until the last five, never red; control and exam keep the real clock"
+    return True, "calm arm: minutes until the last five; neither practice arm is red; the exam keeps its countdown"
 
 
 def _probe_v85_lookalike_outcome(conn, inject=False):
@@ -47665,6 +47736,7 @@ class StudyBar(ctk.CTkToplevel):
     def _finish(self, r):
         rec = study_record(self.participant, True, self.pre, self.tasks, self.sus, self.tlx, r[0])
         rec["uncertainty_style"] = study_uncertainty_style(self.participant)
+        rec["depth"] = depth_snapshot(self.app.conn)
         self.path = write_study_record(rec)
         self.app._uncertainty_style_override = None
         self._clear()
@@ -48267,14 +48339,12 @@ def record_session_affect(conn, summary=None, abandoned=False, session_key=None)
 
 
 def gentle_constraints(conn):
-    """Today's constraint while gentle is active and this occasion's arm is on."""
+    """Today's constraint while gentle is active. Protective, so on for a
+    single learner; compared only between learners in a consenting cohort."""
     st = gentle_state(conn)
     if not st["active"] or not st["occasion"]:
         return None
-    try:
-        if not behaviour_arm(conn, "gentle_restart", st["occasion"]):
-            return None
-    except Exception:
+    if not gentle_cohort_arm(conn):
         return None
     return {"minutes": GENTLE_MINUTES}
 
@@ -48304,27 +48374,14 @@ def retest_deadline_report(conn, now=None):
 
 def retest_slots(conn, base=2):
     """Per-session retest slots: the usual two, plus up to two more when owed
-    retests are near their one-week deadline -- on the randomized occasions of
-    the retest_deadline trial (V9.3: its value depends on the learner)."""
+    retests are near their one-week deadline AND this learner's corrected
+    confident errors are measured to come back (V9.4: a switch on measured
+    return rate against a cost-derived threshold, not a randomized trial,
+    because scheduling is a protected component)."""
     near = retest_deadline_report(conn)["near_deadline"]
     if not near or not RETEST_ESCALATED_EXTRA:
         return base
-    try:
-        wm = conn.execute("SELECT COALESCE(MAX(id), 0) FROM attempts").fetchone()[0]
-    except sqlite3.Error:
-        wm = 0
-    key = f"{date.today().isoformat()}|{wm}"
-    try:
-        init_retest_deadline_schema(conn)
-        cutoff = (datetime.now() - timedelta(days=RETEST_ESCALATE_DAYS)).isoformat()
-        qids = [r[0] for r in conn.execute("SELECT question_id FROM pending_retests WHERE served_at IS NULL "
-                                           "AND created_at <= ?", (cutoff,)).fetchall()]
-        conn.execute("INSERT OR IGNORE INTO retest_deadline_occasions VALUES (?,?,?,NULL)",
-                     (key, json.dumps(qids), datetime.now().isoformat()))
-        conn.commit()
-    except sqlite3.Error:
-        pass
-    if not behaviour_arm(conn, "retest_deadline", key):
+    if not retest_return_rate(conn)["escalate"]:
         return base
     return base + min(RETEST_ESCALATED_EXTRA, near)
 
@@ -48417,10 +48474,15 @@ def build_research_bundle(conn, learner_code, consent):
     events = [{"kind": r["kind"], "skill": r["skill_id"], "before": r["before_tier"], "after": r["after_tier"],
                "session": _hash_key(r["session_key"]), "day": _day_offset(r["occurred_at"], day0)}
               for r in q("SELECT * FROM learning_events")]
+    init_depth_schema(conn)
+    depth = [{"surface": r["surface"], "chosen": r["chosen"], "rendered": r["rendered"], "phase": r["phase"],
+              "gentle_active": r["gentle_active"], "by": r["by"], "day": _day_offset(r["ts"], day0)}
+             for r in q("SELECT * FROM depth_events")]
     return {"schema": RESEARCH_SCHEMA, "learner": learner_code, "consent": True,
-            "app": "Recursa V9.2", "tables": {"attempts": attempts, "exploration_launches": launches,
+            "app": "Recursa V9.4", "tables": {"attempts": attempts, "exploration_launches": launches,
                                               "trial_occasions": occasions, "suggestions": suggestions,
-                                              "reflections": reflections, "learning_events": events}}
+                                              "reflections": reflections, "learning_events": events,
+                                              "depth_events": depth}}
 
 
 def export_research_bundle(conn, learner_code, consent, folder=None):
@@ -48489,29 +48551,8 @@ def _probe_v92_gentle_hysteresis(conn, inject=False):
 
 
 def _probe_v92_retest_deadline(conn, inject=False):
-    init_schema(conn)
-    init_pending_retests_schema(conn)
-    old = (datetime.now() - timedelta(days=RETEST_ESCALATE_DAYS + 1)).isoformat()
-    fresh = datetime.now().isoformat()
-    qs = list(QUIZ_BANK.values())
-    for i in range(6):
-        conn.execute("INSERT INTO pending_retests (question_id, reason, created_at) VALUES (?,?,?)",
-                     (qs[i]["id"], "confident_miss", old if i < 4 else fresh))
-    conn.commit()
-    _saved_share = BEHAVIOUR_TRIALS.get("retest_deadline", {}).get("share", 0.5)
-    BEHAVIOUR_TRIALS["retest_deadline"]["share"] = 1.0
-    try:
-        slots = retest_slots(conn) if not inject else 2
-    finally:
-        BEHAVIOUR_TRIALS["retest_deadline"]["share"] = _saved_share
-    if slots != 4:
-        return False, f"{slots} retest slots with four retests near their one-week deadline"
-    full = _module_source() or ""
-    seg = full[full.find("def compose_session(conn, constraints=None):"):]
-    seg = seg[:seg.find("\ndef ", 10)]
-    if "n_retest_max = retest_slots(conn)" not in seg:
-        return False, "the composer ignores retest deadlines"
-    return True, "retests near their one-week deadline gain up to two extra slots in the next session"
+    """Restated in V9.4: escalation near the deadline follows the measured return rate."""
+    return _probe_v94_retest_switch_measured(conn, inject)
 
 
 def _probe_v92_no_streaks_or_red(conn, inject=False):
@@ -48535,7 +48576,7 @@ def _probe_v92_uncertainty_variant(conn, inject=False):
     styles = {study_uncertainty_style(f"P{i:02d}") for i in range(40)}
     if styles != set(UNCERTAINTY_STYLES):
         return False, "study participants are not assigned to both uncertainty styles"
-    faded = _blend_hex(VIS_PALETTE["fill"], VIS_PALETTE.get("fill_track", C.PAPER), 0.55)
+    faded = _blend_hex(VIS_PALETTE["fill"], VIS_PALETTE.get("fill_track", C.PAPER), FADED_BLEND)
     if inject:
         faded = VIS_PALETTE["fill"]
     if faded == VIS_PALETTE["fill"]:
@@ -49082,37 +49123,8 @@ def lookalike_interference_estimate(conn):
 # ---- standing catalogue: V9.3 ------------------------------------------------------------
 
 def _probe_v93_retest_trial(conn, inject=False):
-    init_schema(conn)
-    init_pending_retests_schema(conn)
-    init_behaviour_schema(conn)
-    old = (datetime.now() - timedelta(days=RETEST_ESCALATE_DAYS + 1)).isoformat()
-    qs = list(QUIZ_BANK.values())
-    for i in range(3):
-        conn.execute("INSERT INTO pending_retests (question_id, reason, created_at) VALUES (?,?,?)",
-                     (qs[i]["id"], "confident_miss", old))
-    conn.commit()
-    arms = []
-    for share in (1.0, 0.0):
-        BEHAVIOUR_TRIALS["retest_deadline"]["share"], saved = share, BEHAVIOUR_TRIALS["retest_deadline"]["share"]
-        conn.execute("DELETE FROM behaviour_occasions WHERE name='retest_deadline'")
-        conn.commit()
-        arms.append(retest_slots(conn))
-        BEHAVIOUR_TRIALS["retest_deadline"]["share"] = saved
-    if inject:
-        arms = [4, 4]
-    if arms != [4, 2]:
-        return False, f"retest slots by arm were {arms}, expected on=4 off=2"
-    init_retest_deadline_schema(conn)
-    created = (datetime.now() - timedelta(days=RETEST_OUTCOME_DAYS + 1)).isoformat()
-    conn.execute("INSERT OR REPLACE INTO retest_deadline_occasions VALUES (?,?,?,NULL)",
-                 ("k-probe", json.dumps([qs[0]["id"]]), created))
-    conn.execute("INSERT INTO attempts (question_id, topic_id, correct, mode, timestamp) VALUES (?,?,?,?,?)",
-                 (qs[0]["id"], qs[0]["topic"], 1, "composed", (datetime.fromisoformat(created) + timedelta(days=2)).isoformat()))
-    conn.commit()
-    behaviour_arm(conn, "retest_deadline", "k-probe")
-    if settle_retest_deadline_outcomes(conn) != 1:
-        return False, "the retest-deadline outcome is not scored from the later answer"
-    return True, "escalation is randomized per occasion (on: 4 slots, off: 2) and scored on later answers in both arms"
+    """Restated in V9.4: escalation is governed by measurement, not randomization."""
+    return _probe_v94_retest_switch_measured(conn, inject)
 
 
 def _probe_v93_verdicts_expire(conn, inject=False):
@@ -49361,6 +49373,564 @@ def contradicted_skills(conn, topics=None):
     return sorted(s for s in SKILLS if SKILLS[s]["topic"] in allowed and skill_evidence_state(
         vs["tiers"].get(s, TIER_NOT_STARTED), vs["answers"].get(s, 0), vs["recent"].get(s)) == "contradicted")
 
+
+
+# ===========================================================================
+# V9.4 -- THE HARMONIZED SURFACE: FIVE DEFECTS REMEDIED, AND A GOVERNED DEPTH
+# ===========================================================================
+# From "The Harmonized Surface" (a review of V9.3 executed against its code):
+#   1. Safety before dwell: demotion to Entry no longer waits for completed
+#      sessions, which abandonment never produces.
+#   2. One registry: every behaviour trial passes the same ethics gate as the
+#      intervention trials. Gentle restart is protective, so it is on for a
+#      single learner (randomized only between learners in a consenting
+#      cohort). Retest escalation leaves randomization and becomes a switch
+#      on this learner's measured return rate of corrected confident errors.
+#   3. Calm clock: neither arm is ever red; the trial's outcome is whether the
+#      timed set is completed rather than abandoned.
+#   4. Contrast: faded evidence blends at 0.45 and the Strong ring is dark
+#      brass, so both clear the 3:1 non-text minimum.
+#   5. No day sequences: the week's practice is an unordered count.
+#   6. Depth: a learner-chosen ceiling per surface (Quiet, Standard, Full),
+#      lowered by phase and pinned to Quiet during a gentle restart, never
+#      raised by the system, with regions in one fixed screen order.
+#   7. Evidence: depth changes are logged, and the study record and research
+#      bundle carry depth and gentle state.
+
+# ---- 2. one registry ----------------------------------------------------------------
+
+def validate_behaviour_trial(name, spec):
+    """The intervention-trial gate, applied to a behaviour trial."""
+    randomises = tuple(spec.get("randomises") or ())
+    if not randomises:
+        raise TrialEthicsError(f"behaviour trial {name!r} must declare what it randomises")
+    for comp in randomises:
+        token = str(comp).strip().lower()
+        for protected in PROTECTED_COMPONENTS:
+            if token == protected or protected in token:
+                raise TrialEthicsError(
+                    f"behaviour trial {name!r} would randomise {comp!r}, which touches the protected "
+                    f"component {protected!r}")
+    if not str(spec.get("withheld_cost") or "").strip():
+        raise TrialEthicsError(f"behaviour trial {name!r} must state what the withheld arm costs the learner")
+    return True
+
+
+def register_behaviour_trial(name, randomises, withheld_cost):
+    """Attach what a behaviour randomises and what withholding it costs, and
+    refuse at import if either fails the gate."""
+    spec = BEHAVIOUR_TRIALS[name]
+    spec["randomises"] = tuple(randomises)
+    spec["withheld_cost"] = withheld_cost
+    validate_behaviour_trial(name, spec)
+    spec["registered"] = True
+    return spec
+
+
+# Superseded: protective or scheduling behaviours are not randomized for one learner.
+BEHAVIOUR_TRIALS.pop("gentle_restart", None)
+BEHAVIOUR_TRIALS.pop("retest_deadline", None)
+
+register_behaviour_trial("reappraisal", ("reappraisal_sentence_before_timed_set",),
+    "One sentence reframing arousal before a timed set; the set, its timing and all feedback are identical.")
+register_behaviour_trial("topic_diagram", ("topic_diagram_in_study_notes",),
+    "A dual-coding diagram in Study Notes; the written notes are identical in both arms.")
+register_behaviour_trial("reflect_before_reveal", ("reflection_prompt_before_learning_events",),
+    "A one-question pause before the debrief's list of what moved; the list itself is shown in both arms.")
+register_behaviour_trial("calm_timer", ("practice_clock_precision",),
+    "Whole minutes versus minutes and seconds on a practice clock; both are navy and the time limit is the same.")
+register_behaviour_trial("lookalike_note", ("lookalike_contrast_sentence_after_miss",),
+    "One extra sentence naming a lookalike skill after a miss; the explanation, correct answer and "
+    "why-wrong card are shown in both arms.")
+register_behaviour_trial("suggestion_strip", ("suggestion_strip_visibility",),
+    "A shortcut to a suggested practice; every suggested practice stays reachable from the Map and Practice.")
+BEHAVIOUR_TRIALS["calm_timer"]["outcome"] = (
+    "whether the timed practice set is completed rather than abandoned (answer churn in the set is "
+    "logged alongside as a secondary measure)")
+
+
+def seal_behaviour_registry():
+    for name, spec in BEHAVIOUR_TRIALS.items():
+        if not spec.get("registered"):
+            raise TrialEthicsError(f"behaviour trial {name!r} was added without registration")
+        validate_behaviour_trial(name, spec)
+    return len(BEHAVIOUR_TRIALS)
+
+
+def gentle_cohort_arm(conn):
+    """Gentle restart is on for a single learner. In a consenting research
+    cohort it may be compared between learners: each learner is assigned once,
+    by a hash of their study code, and no learner carries a per-session arm."""
+    try:
+        if get_setting(conn, "research_cohort_mode", "0") != "1":
+            return True
+        code = get_setting(conn, "research_learner_code", "") or ""
+    except Exception:
+        return True
+    return int(hashlib.sha256(f"gentle-cohort-{code}".encode()).hexdigest()[:8], 16) % 2 == 0
+
+
+# ---- retest escalation as a measured switch ------------------------------------------
+
+DECISION_COSTS["retest_escalation"] = {
+    "c_fp": 1.0, "c_fn": 3.0,
+    "fp": "Spending an extra retest slot on a corrected error that would not have come back: one item of coverage.",
+    "fn": ("Not escalating when corrected confident errors do come back: the error can resurface on the exam, "
+           "and a confident miss there costs more than a lost practice item."),
+}
+RETEST_RETURN_MIN_N = 6
+RETEST_RETURN_GAP_DAYS = 5
+
+
+def _wilson_lower(k, n, z=1.96):
+    if n <= 0:
+        return 0.0
+    p = k / n
+    denom = 1 + z * z / n
+    centre = p + z * z / (2 * n)
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    return max(0.0, (centre - half) / denom)
+
+
+def retest_return_rate(conn):
+    """How often this learner's corrected confident errors come back: a
+    confident miss, later answered correctly, then answered again at least
+    RETEST_RETURN_GAP_DAYS after the correction. Returned = wrong that time."""
+    try:
+        rows = measurement_rows(conn, columns="question_id, correct, confidence, timestamp", order="id ASC")
+    except Exception:
+        rows = []
+    state, k, n = {}, 0, 0
+    for r in rows:
+        q, ok, conf, ts = r["question_id"], int(r["correct"]), r["confidence"], r["timestamp"]
+        s = state.get(q)
+        if s is None:
+            if not ok and conf == 3:
+                state[q] = {"stage": "missed"}
+            continue
+        if s["stage"] == "missed":
+            if ok:
+                s.update(stage="corrected", at=ts)
+            continue
+        if s["stage"] == "corrected":
+            try:
+                gap = (datetime.fromisoformat(ts) - datetime.fromisoformat(s["at"])).days
+            except (TypeError, ValueError):
+                gap = 0
+            if gap >= RETEST_RETURN_GAP_DAYS:
+                n += 1
+                k += 0 if ok else 1
+                state.pop(q, None)
+    lower = _wilson_lower(k, n)
+    return {"returned": k, "n": n, "rate": (k / n) if n else None, "lower": lower,
+            "escalate": n >= RETEST_RETURN_MIN_N and lower >= decision_threshold("retest_escalation")}
+
+
+# ---- 4. contrast ---------------------------------------------------------------------
+
+FADED_BLEND = 0.45
+VIS_PALETTE["ring"] = C.BRASS_DARK
+COARSE_GLYPH_RING_NOTE = "Strong ring in dark brass for 3:1 contrast (V9.4)"
+
+
+def _rel_lum(hexc):
+    c = [int(hexc[i:i + 2], 16) / 255.0 for i in (1, 3, 5)]
+    c = [x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4 for x in c]
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+
+
+def contrast_ratio(a, b):
+    la, lb = sorted((_rel_lum(a), _rel_lum(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+# ---- 6. depth ----------------------------------------------------------------------------
+
+DEPTH_ORDER = ("Quiet", "Standard", "Full")
+DEPTH_DEFAULT = {"A": "Quiet", "B": "Standard", "C": "Standard"}
+DEPTH_PHASE_CAP = {"A": "Standard", "B": "Full", "C": "Full"}
+DEPTH_SURFACES = ("today", "map", "practice", "insights")
+
+# One fixed screen order per surface; each region carries the shallowest level
+# that shows it. A deeper level only adds regions into this order, so nothing
+# moves when depth changes. Accessibility entries are Quiet on purpose: the
+# list view and the screen-reader map are never behind a depth control.
+DEPTH_REGIONS = {
+    "today": (("headline", "Quiet"), ("action", "Quiet"), ("session_structure", "Standard"),
+              ("suggestions", "Standard"), ("why_chosen", "Standard"), ("mini_map", "Standard"),
+              ("in_motion", "Full"), ("next_milestone", "Standard"), ("exam_date", "Quiet"),
+              ("pace_line", "Standard")),
+    "map": (("search", "Quiet"), ("accessible_list", "Quiet"), ("screen_reader_map", "Quiet"),
+            ("filters", "Standard"), ("links_control", "Standard"), ("coarse_states", "Quiet"),
+            ("evidence_overlays", "Standard"), ("inspector_tier_word", "Standard"),
+            ("links_on_selection", "Standard"), ("compare_mode", "Full"), ("all_links", "Full")),
+    "practice": (("next_rung", "Quiet"), ("ladder", "Standard"), ("waiting", "Standard"),
+                 ("tools", "Standard"), ("model_views", "Full"), ("pace_words", "Full"),
+                 ("what_else_helps", "Standard")),
+    "insights": (("week_movement", "Standard"), ("what_moved", "Quiet"), ("confidence", "Standard"),
+                 ("ask_about_skill", "Standard"), ("mixups_seen", "Full"), ("area_movement", "Full"),
+                 ("disagree", "Standard")),
+}
+
+
+def depth_rank(level):
+    return DEPTH_ORDER.index(level) if level in DEPTH_ORDER else 0
+
+
+def effective_depth(chosen, phase, gentle_active, calm_only=False):
+    cap = DEPTH_PHASE_CAP.get(phase, "Standard")
+    if gentle_active or calm_only:
+        cap = "Quiet"
+    chosen = chosen if chosen in DEPTH_ORDER else DEPTH_DEFAULT.get(phase, "Quiet")
+    return DEPTH_ORDER[min(depth_rank(chosen), depth_rank(cap))]
+
+
+def depth_transition(stored, surface, requested, by):
+    st = dict(stored or {})
+    cur = st.get(surface)
+    if requested not in DEPTH_ORDER:
+        return st, False
+    if by != "learner" and cur is not None and depth_rank(requested) > depth_rank(cur):
+        return st, False            # the system never raises
+    st[surface] = requested
+    return st, True
+
+
+def blocks_for(surface, depth):
+    return tuple(name for name, lvl in DEPTH_REGIONS[surface] if depth_rank(lvl) <= depth_rank(depth))
+
+
+def init_depth_schema(conn):
+    conn.execute("CREATE TABLE IF NOT EXISTS depth_events (ts TEXT, surface TEXT, chosen TEXT, rendered TEXT, "
+                 "phase TEXT, gentle_active INTEGER, by TEXT)")
+    conn.commit()
+
+
+def stored_depths(conn):
+    try:
+        return json.loads(get_setting(conn, "view_depth", "") or "{}")
+    except ValueError:
+        return {}
+
+
+def view_depth(conn, surface):
+    """What the surface renders now: the learner's choice under the phase
+    ceiling, and Quiet while a gentle restart is active."""
+    phase = learner_phase(conn)
+    gentle = gentle_state(conn)["active"]
+    return effective_depth(stored_depths(conn).get(surface), phase, gentle)
+
+
+def set_view_depth(conn, surface, requested, by="learner"):
+    st, ok = depth_transition(stored_depths(conn), surface, requested, by)
+    if not ok:
+        return False
+    set_setting(conn, "view_depth", json.dumps(st))
+    try:
+        init_depth_schema(conn)
+        conn.execute("INSERT INTO depth_events VALUES (?,?,?,?,?,?,?)",
+                     (datetime.now().isoformat(), surface, requested, view_depth(conn, surface),
+                      learner_phase(conn), int(gentle_state(conn)["active"]), by))
+        conn.commit()
+    except sqlite3.Error:
+        pass
+    return True
+
+
+def depth_levels_available(conn):
+    phase = learner_phase(conn)
+    if gentle_state(conn)["active"]:
+        return ("Quiet",)
+    cap = DEPTH_PHASE_CAP.get(phase, "Standard")
+    return DEPTH_ORDER[:depth_rank(cap) + 1]
+
+
+def depth_control(parent, app, surface):
+    """A small, stable control at the top right of each place."""
+    conn = app.conn
+    levels = depth_levels_available(conn)
+    current = view_depth(conn, surface)
+    row = ctk.CTkFrame(parent, fg_color="transparent")
+    ctk.CTkLabel(row, text="Show", font=(FONT_BODY, 10), text_color=C.INK_DIM).pack(side="left", padx=(0, 4))
+    var = ctk.StringVar(value=current)
+
+    def choose(v):
+        if set_view_depth(conn, surface, v, by="learner"):
+            app.show_view(surface)
+    seg = ctk.CTkSegmentedButton(row, values=list(levels), variable=var, command=choose)
+    seg.pack(side="left")
+    if gentle_state(conn)["active"]:
+        ctk.CTkLabel(row, text="Quiet while easing back in", font=(FONT_BODY, 10),
+                     text_color=C.INK_DIM).pack(side="left", padx=(6, 0))
+    app._depth_controls = getattr(app, "_depth_controls", {})
+    app._depth_controls[surface] = seg
+    return row
+
+
+# ---- Full-depth presenters (the bridge from the old dense views) ---------------------------
+
+def present_area_movement(conn, days=7):
+    """Movement by area over the week, in words and counts."""
+    try:
+        init_learning_events_schema(conn)
+        since = (date.today() - timedelta(days=days - 1)).isoformat()
+        rows = _safe_query(conn, "SELECT kind, skill_id FROM learning_events WHERE substr(occurred_at,1,10) >= ?",
+                           (since,))
+    except Exception:
+        rows = []
+    by = {}
+    for r in rows:
+        sid = r["skill_id"]
+        if sid not in SKILLS or r["kind"] not in LEARNING_EVENT_ADVANCES:
+            continue
+        tid = SKILLS[sid]["topic"]
+        by[tid] = by.get(tid, 0) + 1
+    out = []
+    for tid in vis_domain_order():
+        if by.get(tid):
+            name = TOPICS[tid].get("short") or TOPICS[tid]["name"]
+            out.append(f"{name}: {_plural(by[tid], 'step')} forward this week")
+    return out or ["No area has moved yet this week."]
+
+
+def present_mixups_seen(conn, days=14):
+    """Lookalike pairs that came up with a miss on either side recently."""
+    since = (date.today() - timedelta(days=days)).isoformat()
+    try:
+        rows = measurement_rows(conn, where="substr(timestamp,1,10) >= ?", params=(since,),
+                                columns="question_id, correct")
+    except Exception:
+        rows = []
+    seen, missed = set(), set()
+    for r in rows:
+        for sid in Q_MATRIX.get(r["question_id"], []):
+            seen.add(sid)
+            if not int(r["correct"]):
+                missed.add(sid)
+    out = []
+    for p in vis_confusion_pairs():
+        if p["a"] in seen and p["b"] in seen and (p["a"] in missed or p["b"] in missed):
+            out.append(f"{SKILLS[p['a']]['label']} and {SKILLS[p['b']]['label']}: came up with a miss")
+    return out[:6] or ["No lookalike pair has tripped you up in the last two weeks."]
+
+
+def present_pace_words(conn):
+    try:
+        line = learner_state_for(conn).get("pressure_line")
+    except Exception:
+        line = None
+    return [line] if line else ["There is not yet enough timed practice to say whether pace or knowledge is the limit."]
+
+
+# ---- evidence ------------------------------------------------------------------------------
+
+def depth_snapshot(conn):
+    return {"chosen": stored_depths(conn), "rendered": {s: view_depth(conn, s) for s in DEPTH_SURFACES},
+            "phase": learner_phase(conn), "gentle_active": gentle_state(conn)["active"]}
+
+
+# ---- standing catalogue: V9.4 ----------------------------------------------------------------
+
+def _probe_v94_demotion_reachable(conn, inject=False):
+    init_schema(conn)
+    set_setting(conn, "learner_phase", "B")
+    set_setting(conn, "phase_dwell_sessions", "0")
+    set_setting(conn, "phase_demote_pending", "0")
+    trace = []
+    for i in range(4):
+        log_session_event(conn, "abandon", "composed", n_items=2)
+        trace.append(update_learner_phase(conn, completed=False) if not inject else "B")
+    if trace[-1] != "A":
+        return False, f"four abandons after promotion leave the phase at {trace[-1]} ({trace})"
+    set_setting(conn, "learner_phase", "B")
+    set_setting(conn, "phase_demote_pending", "0")
+    conn.execute("DELETE FROM session_events")
+    conn.commit()
+    log_session_event(conn, "abandon", "composed", n_items=2)
+    if update_learner_phase(conn, completed=False) != "B":
+        return False, "a single abandon demoted the learner"
+    return True, f"repeated abandonment returns the learner to Entry ({' -> '.join(trace)}); one abandon does not"
+
+
+def _probe_v94_single_registry(conn, inject=False):
+    trials = dict(BEHAVIOUR_TRIALS)
+    if inject:
+        trials["sneaky"] = {"share": 0.5}
+    for name, spec in trials.items():
+        if not spec.get("registered"):
+            return False, f"behaviour trial {name!r} bypassed the ethics gate"
+        try:
+            validate_behaviour_trial(name, spec)
+        except TrialEthicsError as e:
+            return False, str(e)
+    for bad in ({"randomises": ("scheduling_of_retests",), "withheld_cost": "x"},
+                {"randomises": ("banner",), "withheld_cost": ""}):
+        try:
+            validate_behaviour_trial("probe", bad)
+            return False, "the gate accepted a protected component or an unstated cost"
+        except TrialEthicsError:
+            pass
+    if "gentle_restart" in BEHAVIOUR_TRIALS or "retest_deadline" in BEHAVIOUR_TRIALS:
+        return False, "a protective or scheduling behaviour is still randomized per occasion"
+    return True, f"all {len(trials)} behaviour trials passed the gate; protected and uncosted specs are refused"
+
+
+def _probe_v94_clock_never_red(conn, inject=False):
+    for calm in (False, True):
+        for rem in (1800, 301, 120, 59, 10, 0):
+            _t, col = timer_display(rem, calm)
+            if inject and not calm and rem < 60:
+                col = C.STAMP
+            if col in (C.STAMP, getattr(C, "STAMP_DIM", C.STAMP)):
+                return False, f"the {'calm' if calm else 'control'} practice clock turns red at {rem} seconds"
+    if "completed" not in BEHAVIOUR_TRIALS["calm_timer"]["outcome"]:
+        return False, "the calm-clock trial is not scored on completion"
+    import inspect
+    if "calm_timer" not in inspect.getsource(QuestionSession.abandon):
+        return False, "an abandoned timed set is not scored as not completed"
+    return True, "neither practice-clock arm is ever red; the trial scores completion, with abandonment as zero"
+
+
+def _probe_v94_state_mark_contrast(conn, inject=False):
+    P = VIS_PALETTE
+    blend = 0.55 if inject else FADED_BLEND
+    faded = _blend_hex(P["fill"], P["fill_track"], blend)
+    checks = {"faded fill on track": contrast_ratio(faded, P["fill_track"]),
+              "faded fill on paper": contrast_ratio(faded, C.PAPER),
+              "faded vs full fill": contrast_ratio(faded, P["fill"]),
+              "Strong ring on paper": contrast_ratio(P["ring"], C.PAPER),
+              "Strong ring on dimmed surface": contrast_ratio(P["ring"], C.PAPER_DIM)}
+    low = {k: round(v, 2) for k, v in checks.items() if v < 3.0}
+    if low:
+        return False, f"state marks below 3:1: {low}"
+    return True, "faded fill and Strong ring clear 3:1 on every adjacent colour (" + ", ".join(
+        f"{k} {v:.2f}" for k, v in checks.items()) + ")"
+
+
+def _probe_v94_no_day_sequence(conn, inject=False):
+    init_schema(conn)
+    wk = present_week(conn)
+    if inject:
+        wk = dict(wk, days=[{"day": "Mon", "practised": True}, {"day": "Tue", "practised": False}])
+
+    def has_day_sequence(obj):
+        if isinstance(obj, list) and len(obj) >= 2 and all(isinstance(x, dict) for x in obj):
+            keys = set().union(*(x.keys() for x in obj))
+            if keys & {"practised", "practiced", "active"} and keys & {"day", "date"}:
+                return True
+        if isinstance(obj, dict):
+            return any(has_day_sequence(v) for v in obj.values())
+        if isinstance(obj, (list, tuple)):
+            return any(has_day_sequence(v) for v in obj)
+        return False
+    if has_day_sequence(wk):
+        return False, "a learner presenter renders an ordered row of days with a practised flag"
+    if not isinstance(wk.get("practised_days"), int):
+        return False, "the week's practice is not an unordered count"
+    return True, "the week shows how many days had practice, never which days in a row"
+
+
+def _probe_v94_depth_contract(conn, inject=False):
+    for surface in DEPTH_SURFACES:
+        prev = ()
+        for lvl in DEPTH_ORDER:
+            cur = blocks_for(surface, lvl)
+            it = iter(cur)
+            if not all(r in it for r in prev):
+                return False, f"{surface} at {lvl} reorders or drops a shallower region"
+            prev = cur
+        for must in {"map": ("accessible_list", "screen_reader_map")}.get(surface, ()):
+            if must not in blocks_for(surface, "Quiet"):
+                return False, f"{must} is hidden behind a depth control"
+    for phase in "ABC":
+        for chosen in DEPTH_ORDER:
+            if effective_depth(chosen, phase, True) != "Quiet":
+                return False, "gentle restart does not pin the surface to Quiet"
+            eff = effective_depth(chosen, phase, False)
+            if depth_rank(eff) > depth_rank(chosen):
+                return False, "a surface renders deeper than the learner chose"
+    if effective_depth("Full", "A", False) == "Full":
+        return False, "Full is reachable in Entry"
+    st, ok = depth_transition({"today": "Quiet"}, "today", "Full", by="system")
+    if inject:
+        ok = True
+    if ok:
+        return False, "the system raised a learner's depth"
+    outputs = [present_area_movement(conn), present_mixups_seen(conn), present_pace_words(conn)]
+    text = json.dumps(outputs)
+    if VIS_FORBIDDEN.search(text) or VIS_PREDICTIVE.search(text):
+        return False, "a Full-depth presenter breaks the vocabulary contract"
+    return True, "nested fixed order; gentle pins Quiet; never deeper than chosen; no Full in Entry; system raise refused"
+
+
+def _probe_v94_retest_switch_measured(conn, inject=False):
+    init_schema(conn)
+    q = list(QUIZ_BANK.values())
+    t0 = datetime.now() - timedelta(days=30)
+    for i in range(8):
+        qid = q[i]["id"]
+        for dt, ok, conf in ((0, 0, 3), (1, 1, 2), (8, 0 if i < 5 else 1, 2)):
+            conn.execute("INSERT INTO attempts (question_id, topic_id, correct, mode, timestamp, confidence) "
+                         "VALUES (?,?,?,?,?,?)", (qid, q[i]["topic"], ok, "quiz", (t0 + timedelta(days=dt)).isoformat(), conf))
+    conn.commit()
+    rr = retest_return_rate(conn)
+    if rr["n"] != 8 or rr["returned"] != 5:
+        return False, f"return rate miscounted ({rr['returned']} of {rr['n']}, expected 5 of 8)"
+    decision = rr["escalate"] if not inject else (not rr["escalate"])
+    expect = rr["n"] >= RETEST_RETURN_MIN_N and rr["lower"] >= decision_threshold("retest_escalation")
+    if decision != expect or not expect:
+        return False, "escalation does not follow the measured return rate against its cost threshold"
+    # A learner whose corrected errors hold gets no escalation.
+    conn.execute("DELETE FROM attempts")
+    for i in range(8):
+        qid = q[i]["id"]
+        for dt, ok, conf in ((0, 0, 3), (1, 1, 2), (8, 1, 2)):
+            conn.execute("INSERT INTO attempts (question_id, topic_id, correct, mode, timestamp, confidence) "
+                         "VALUES (?,?,?,?,?,?)", (qid, q[i]["topic"], ok, "quiz", (t0 + timedelta(days=dt)).isoformat(), conf))
+    conn.commit()
+    if retest_return_rate(conn)["escalate"]:
+        return False, "escalation fires for a learner whose corrected errors do not come back"
+    import inspect
+    src = inspect.getsource(retest_slots)
+    if "behaviour_arm" in src or "retest_return_rate" not in src:
+        return False, "retest escalation is still randomized"
+    return True, (f"escalates at a measured return of {rr['returned']} of {rr['n']} (lower bound {rr['lower']:.2f} "
+                  f"vs threshold {decision_threshold('retest_escalation'):.2f}), not at 0 of 8; no randomization")
+
+
+for _name, _spec in (
+    ("v94_demotion_unreachable", {"title": "Distress that cannot lower the phase",
+        "failure_class": "A safety transition gated on a counter that the distress itself never increments.",
+        "invariant": "Repeated abandonment returns the learner to Entry; a single abandon does not.",
+        "found_in": "The Harmonized Surface, Finding 1.", "probe": _probe_v94_demotion_reachable}),
+    ("v94_second_trial_registry", {"title": "Trials that bypass the ethics gate",
+        "failure_class": "A registry filled by assignment, so protected components and uncosted arms pass unchecked.",
+        "invariant": "Every behaviour trial is registered through the gate; protective and scheduling behaviours are not randomized per occasion.",
+        "found_in": "The Harmonized Surface, Finding 2.", "probe": _probe_v94_single_registry}),
+    ("v94_red_practice_clock", {"title": "A threat cue in the control arm",
+        "failure_class": "Keeping an alarming display as a comparison arm, and scoring it on an outcome it does not target.",
+        "invariant": "No practice clock is ever red; the trial scores completion.",
+        "found_in": "The Harmonized Surface, Finding 3.", "probe": _probe_v94_clock_never_red}),
+    ("v94_low_contrast_marks", {"title": "State marks too faint to see",
+        "failure_class": "Graphical state marks below the 3:1 non-text contrast minimum.",
+        "invariant": "Faded fill and Strong ring clear 3:1 against every adjacent colour.",
+        "found_in": "The Harmonized Surface, Finding 4 (WCAG 2.2 SC 1.4.11).", "probe": _probe_v94_state_mark_contrast}),
+    ("v94_day_contiguity", {"title": "A streak under another name",
+        "failure_class": "A row of practised and missed days, which loss aversion reads as a streak.",
+        "invariant": "No learner presenter renders an ordered sequence of days with a practised flag.",
+        "found_in": "The Harmonized Surface, Finding 5.", "probe": _probe_v94_no_day_sequence}),
+    ("v94_depth_contract", {"title": "An information-load control the system can override upward",
+        "failure_class": "Depth that rearranges the screen, rises without the learner, ignores distress or phase, or hides accessibility.",
+        "invariant": "Nested fixed order; gentle pins Quiet; never deeper than chosen; no Full in Entry; system raises refused; Full presenters obey the contract.",
+        "found_in": "The Harmonized Surface, Part V.", "probe": _probe_v94_depth_contract}),
+    ("v94_retest_escalation_randomized", {"title": "Scheduling varied for measurement",
+        "failure_class": "Randomizing a protected scheduling component to learn whether it helps.",
+        "invariant": "Retest escalation follows this learner's measured return rate against a cost-derived threshold.",
+        "found_in": "The Harmonized Surface, Finding 2 and Part VII.", "probe": _probe_v94_retest_switch_measured}),
+):
+    register_adversarial_class(_name, _spec)
+
+seal_behaviour_registry()
 
 
 def main():

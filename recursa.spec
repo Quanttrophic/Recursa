@@ -27,8 +27,8 @@ import sys
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 APP_NAME = "Recursa"
-APP_MODULE = "nj_re_trainer_gui_V9_3"
-APP_VERSION = "9.3.0"
+APP_MODULE = "recursa_app"
+APP_VERSION = "9.4.0"
 BUNDLE_ID = "com.bearproperties.recursa"
 HERE = os.path.abspath(SPECPATH)
 SRC = os.path.join(HERE, "src")

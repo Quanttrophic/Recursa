@@ -25,7 +25,7 @@ def _report(text):
 
 
 def _app():
-    import nj_re_trainer_gui_V9_3 as app
+    import recursa_app as app
     return app
 
 
