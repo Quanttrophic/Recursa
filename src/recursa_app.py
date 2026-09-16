@@ -45632,7 +45632,7 @@ def vis_in_motion(parent, app, vs):
 
 # ---- views ---------------------------------------------------------------------
 
-def view_map(app, parent):
+def view_map_v95(app, parent):
     wrap = ctk.CTkFrame(parent, fg_color="transparent")
     wrap.pack(fill="both", expand=True, padx=28, pady=22)
     section_title(wrap, "Map", "Every exam area and skill, in the same place every time. "
@@ -45715,6 +45715,8 @@ def view_practice(app, parent):
         for _ln in present_pace_words(conn):
             ctk.CTkLabel(wrap, text=_ln, font=(FONT_BODY, 11), text_color=C.INK, anchor="w", justify="left",
                          wraplength=640).pack(anchor="w")
+    if "pace_lists" in _show:
+        render_pace_lists(app, wrap)
     if "what_else_helps" in _show:
         what_else_helps_disclosure(wrap)
 
@@ -45901,6 +45903,8 @@ def view_insights(app, parent):
                  wraplength=640).pack(anchor="w", pady=(2, 0))
     if "confidence" not in _show:
         c2.destroy()
+    if "confidence_misleads" in _show:
+        render_confidence_misleads(app, wrap)
     if "ask_about_skill" in _show:
         ctk.CTkLabel(wrap, text="Ask about any skill", font=(FONT_BODY, 13, "bold"), text_color=C.INK,
                      anchor="w").pack(anchor="w", pady=(6, 2))
@@ -45920,6 +45924,7 @@ def view_insights(app, parent):
             for _ln in _lines(conn):
                 ctk.CTkLabel(_i, text=_ln, font=(FONT_BODY, 11), text_color=C.INK, anchor="w", justify="left",
                              wraplength=640).pack(anchor="w")
+    render_underneath_and_clusters(app, wrap, _show)
     if "disagree" in _show:
         row = ctk.CTkFrame(wrap, fg_color="transparent")
         row.pack(anchor="w", pady=(12, 0))
@@ -46575,8 +46580,8 @@ for _name, _spec in (
 
 
 # The three new surfaces join the view registry; "progress" now opens the map.
-VIEW_MAP.update({"map": view_map, "practice": view_practice, "insights": view_insights,
-                 "progress": view_map})
+VIEW_MAP.update({"map": view_map_v95, "practice": view_practice, "insights": view_insights,
+                 "progress": view_map_v95})
 
 
 # ===========================================================================
@@ -51869,6 +51874,602 @@ seal_behaviour_registry()
 
 VIEW_MAP.update({"cases": view_cases, "mathlab": view_mathlab, "sortit": view_sort, "teachit": view_teach,
                  "connectit": view_connect, "pocket": view_pocket})
+
+
+# ===========================================================================
+# V9.6 -- THE RICHER SURFACE: THE OLD SCREENS' BEST IDEAS, UNDER THE CONTRACT
+# ===========================================================================
+# The pre-restructuring build had screens that gave the learner something to
+# act on -- a radial learner model, a confidence-by-correctness grid, "one
+# thing underneath several of these", concept clusters of misses, and pace
+# lists with a drill button -- but showed them among 24 peer entries, led
+# with theta and P(pass), and painted misses red. V9.6 brings the ideas back
+# into the four places, in words, placed by Depth:
+#   * Map: an area wheel as the overview. Position is curriculum (fixed);
+#     distance from the centre and softness say how much evidence there is;
+#     the arc says how much of the area is under way.
+#   * Insights (Standard): where confidence misleads you -- the 2x2 in words,
+#     and the sure-but-wrong questions with a button to practise them.
+#   * Insights (Full): the one skill underneath several misses, and groups of
+#     misses that share an idea, each with its own practice button.
+#   * Practice (Full): right-but-slow and fast-and-wrong answers, each with a
+#     drill (a paced drill for the slow ones, a deliberate re-read for guesses).
+# Author tools (question quality, bank audit, self-improvement) stay author-only.
+
+import threading as _threading_v96
+
+# ---- depth placement ---------------------------------------------------------------
+
+def _insert_region(surface, after, name, level):
+    regions = list(DEPTH_REGIONS[surface])
+    names = [r[0] for r in regions]
+    regions.insert(names.index(after) + 1, (name, level))
+    DEPTH_REGIONS[surface] = tuple(regions)
+
+
+_insert_region("map", "search", "area_wheel", "Quiet")
+_insert_region("insights", "confidence", "confidence_misleads", "Standard")
+_insert_region("insights", "area_movement", "underneath", "Full")
+_insert_region("insights", "underneath", "miss_clusters", "Full")
+_insert_region("practice", "pace_words", "pace_lists", "Full")
+
+
+# ---- shared: a drill over specific questions ----------------------------------------
+
+def drill_questions(app, ids, title, subtitle, timed=False, back="insights"):
+    pool = [QUIZ_BANK[i] for i in ids if i in QUIZ_BANK]
+    if not pool:
+        return None
+    for w in app.content.winfo_children():
+        w.destroy()
+    return QuestionSession(
+        app, app.content, pool, "progressive_strict" if timed else "quiz", title, subtitle,
+        allow_hints=not timed, timed=timed,
+        total_seconds=(round(len(pool) * PACE_TARGET_SECONDS) if timed else None),
+        on_finish=lambda _s: app.show_view(back))
+
+
+def _distinct_ids(rows_or_ids, limit=6):
+    out = []
+    for r in rows_or_ids:
+        qid = r if isinstance(r, str) else r["question_id"]
+        if qid in QUIZ_BANK and qid not in out:
+            out.append(qid)
+        if len(out) >= limit:
+            break
+    return out
+
+
+# ---- presenters ------------------------------------------------------------------------
+
+QUADRANT_WORDS = (
+    ("confident_right", "Sure and right", "knowledge you can lean on"),
+    ("confident_wrong", "Sure but wrong", "the ones most worth a second look"),
+    ("unsure_right", "Unsure but right", "you know more here than you give yourself credit for"),
+    ("unsure_wrong", "Unsure and wrong", "plainly still to learn, and that is fine"),
+)
+
+
+def present_confidence_misleads(conn):
+    try:
+        quad = confidence_quadrants(conn)
+    except Exception:
+        quad = {}
+    total = sum(len(quad.get(k, [])) for k, _t, _w in QUADRANT_WORDS)
+    cells = [{"key": k, "title": t, "count": len(quad.get(k, [])), "words": w} for k, t, w in QUADRANT_WORDS]
+    ids = _distinct_ids(list(reversed(quad.get("confident_wrong", []))))
+    return {"enough": total >= 12, "cells": cells, "drill_ids": ids,
+            "drill_stems": [QUIZ_BANK[i]["q"] for i in ids]}
+
+
+def present_underneath(conn):
+    try:
+        rows = conn.execute("SELECT question_id FROM error_log WHERE active=1").fetchall()
+    except sqlite3.Error:
+        return None
+    by_skill = {}
+    for r in rows:
+        sk = Q_MATRIX.get(r[0]) or []
+        if sk:
+            by_skill.setdefault(sk[0], []).append(r[0])
+    roots = {}
+    for sid, qids in by_skill.items():
+        try:
+            b = upstream_bottleneck(conn, sid)
+        except Exception:
+            b = None
+        if b and b.get("skill") in SKILLS:
+            roots.setdefault(b["skill"], []).extend(qids)
+    if not roots:
+        return None
+    root, qids = max(roots.items(), key=lambda kv: len(kv[1]))
+    if len(qids) < 2:
+        return None
+    practice = [q["id"] for q in items_for_skill(root)][:6]
+    return {"skill": root, "label": SKILLS[root]["label"], "misses": len(qids),
+            "line": (f"{len(qids)} {'miss' if len(qids) == 1 else 'misses'} rest on {SKILLS[root]['label']}. "
+                     "Practising that first helps several at once."),
+            "drill_ids": practice}
+
+
+def present_miss_clusters(conn, limit=4):
+    try:
+        clusters, _tier, _note = semantic_cluster_best(conn)
+    except Exception:
+        return []
+    out = []
+    for c in clusters:
+        members = [m for m in c.get("members", []) if m in QUIZ_BANK]
+        if len(members) < 2:
+            continue
+        labels = []
+        for m in members:
+            for s in Q_MATRIX.get(m, []):
+                lab = SKILLS.get(s, {}).get("label")
+                if lab and lab not in labels:
+                    labels.append(lab)
+        rep = QUIZ_BANK.get(c.get("rep_id")) or QUIZ_BANK[members[0]]
+        out.append({"title": f"{len(members)} misses around " + (labels[0] if labels else "one idea"),
+                    "also": labels[1:3], "example": rep["q"], "drill_ids": members[:6]})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def present_pace_lists(conn):
+    try:
+        s = timing_summary(conn)
+    except Exception:
+        s = None
+    if not s:
+        return None
+    slow = _distinct_ids(s.get("slow_correct") or [])
+    fast = _distinct_ids(s.get("fast_wrong") or [])
+    return {
+        "slow": {"title": "Right, but slow", "words": ("Answers you got right that took far longer than the exam "
+                                                       "allows. A paced drill on these builds speed on what you know."),
+                 "ids": slow, "stems": [QUIZ_BANK[i]["q"] for i in slow]},
+        "fast": {"title": "Very fast and wrong", "words": ("Answered almost at once and missed. That usually means the "
+                                                           "question was skimmed; a slow, deliberate re-read helps."),
+                 "ids": fast, "stems": [QUIZ_BANK[i]["q"] for i in fast]},
+    }
+
+
+# ---- the area wheel -----------------------------------------------------------------------
+
+WHEEL_EVIDENCE_FULL = 40          # answers in an area at which it sits at the inner ring
+WHEEL_MAX_SOFTNESS = FADED_BLEND  # never fainter than the 3:1 contrast floor allows
+
+
+def present_area_wheel(vs, width=620, height=620):
+    """Fixed curriculum positions around the circle; distance from the centre
+    and softness carry how much evidence there is; the arc carries how much of
+    the area is under way. Words for every area, no numbers beyond counts."""
+    order = vis_domain_order()
+    cx, cy = width / 2.0, height / 2.0
+    r_in, r_out = min(width, height) * 0.24, min(width, height) * 0.40
+    nodes = []
+    for k, tid in enumerate(order):
+        sids = vis_skills_of(tid)
+        answers = sum(vs["answers"].get(s, 0) for s in sids)
+        started = [s for s in sids if vs["tiers"].get(s) not in (TIER_NOT_STARTED, None)]
+        strong = [s for s in sids if COARSE_OF.get(vs["tiers"].get(s)) == COARSE_STRONG]
+        certainty = min(1.0, answers / float(WHEEL_EVIDENCE_FULL))
+        radius = r_in + (1.0 - certainty) * (r_out - r_in)
+        ang = -math.pi / 2 + 2 * math.pi * k / len(order)
+        name = TOPICS[tid].get("short") or TOPICS[tid]["name"]
+        evidence_words = ("plenty of evidence" if certainty >= 0.75 else
+                          "some evidence" if certainty >= 0.25 else "not much evidence yet")
+        nodes.append({"tid": tid, "name": name, "x": cx + radius * math.cos(ang), "y": cy + radius * math.sin(ang),
+                      "angle": ang, "certainty": certainty, "softness": (1.0 - certainty) * WHEEL_MAX_SOFTNESS,
+                      "started_share": len(started) / float(len(sids)) if sids else 0.0,
+                      "words": (f"{name}: {len(started)} of {_plural(len(sids), 'skill')} under way, "
+                                f"{len(strong)} strong; {evidence_words}.")})
+    centre = f"{vs.get('n_solid', 0)} of {vs.get('n_total', len(SKILLS))} skills solid"
+    return {"nodes": nodes, "centre": centre, "cx": cx, "cy": cy, "r_in": r_in, "r_out": r_out}
+
+
+class AreaWheel(tk.Canvas):
+    """The Map's overview. Click or press Enter on an area to open it; arrow
+    keys move around the wheel; the line under the wheel says where you are."""
+
+    def __init__(self, parent, app, vs=None, size=620, on_open=None, status=None):
+        width = int(size * 1.3)          # room for the area names on both sides
+        super().__init__(parent, width=width, height=size, bg=C.PAPER, highlightthickness=0, takefocus=1)
+        self.app, self.on_open, self.status = app, on_open, status
+        self.vs = vs or gather_visual_state(app.conn)
+        self.model = present_area_wheel(self.vs, width, size)
+        self.focus_idx = 0
+        self._items = {}
+        self.draw()
+        self.bind("<Button-1>", self._click)
+        self.bind("<Motion>", self._hover)
+        for key in ("<Left>", "<Up>"):
+            self.bind(key, lambda e: self.move(-1))
+        for key in ("<Right>", "<Down>"):
+            self.bind(key, lambda e: self.move(1))
+        self.bind("<Return>", lambda e: self.open(self.focus_idx))
+        self.bind("<FocusIn>", lambda e: self.draw())
+
+    def draw(self):
+        self.delete("all")
+        m = self.model
+        cx, cy = m["cx"], m["cy"]
+        for r, dash in ((m["r_in"], ()), (m["r_out"], (3, 5))):
+            self.create_oval(cx - r, cy - r, cx + r, cy + r, outline=C.PAPER_LINE, dash=dash)
+        for n in m["nodes"]:
+            self.create_line(cx, cy, n["x"], n["y"], fill=C.PAPER_LINE)
+        self.create_oval(cx - 70, cy - 70, cx + 70, cy + 70, fill=C.NAVY, outline=C.BRASS, width=2)
+        self.create_text(cx, cy - 14, text="YOUR MAP", fill=C.GOLD_SOFT if hasattr(C, "GOLD_SOFT") else C.CREAM,
+                         font=(FONT_BODY, 9, "bold"))
+        self.create_text(cx, cy + 10, text=m["centre"], fill=C.CREAM, width=120, font=(FONT_DISPLAY, 11, "bold"),
+                         justify="center")
+        self._items = {}
+        for k, n in enumerate(m["nodes"]):
+            x, y, R = n["x"], n["y"], 17
+            fill = _blend_hex(C.NAVY, C.PAPER_DIM, n["softness"])
+            self.create_oval(x - R - 7, y - R - 7, x + R + 7, y + R + 7, outline=C.PAPER_LINE, width=1)
+            if n["started_share"] > 0:
+                self.create_arc(x - R - 7, y - R - 7, x + R + 7, y + R + 7, start=90,
+                                extent=-359.9 * n["started_share"], style="arc", outline=C.BRASS_DARK, width=4)
+            oid = self.create_oval(x - R, y - R, x + R, y + R, fill=fill, outline=C.NAVY, width=1)
+            if n["certainty"] < 0.25:
+                self.create_oval(x - R - 3, y - R - 3, x + R + 3, y + R + 3, outline=C.INK_DIM, dash=(2, 3))
+            if self.focus_get() is self and k == self.focus_idx:
+                self.create_oval(x - R - 11, y - R - 11, x + R + 11, y + R + 11, outline=C.BRASS, width=3)
+            lx = x + 44 * math.cos(n["angle"])
+            ly = y + 44 * math.sin(n["angle"])
+            anchor = "w" if math.cos(n["angle"]) > 0.3 else ("e" if math.cos(n["angle"]) < -0.3 else "center")
+            self.create_text(lx, ly, text=n["name"], anchor=anchor, width=150, fill=C.INK, font=(FONT_BODY, 10))
+            self._items[oid] = k
+        self._say(self.focus_idx)
+
+    def _say(self, k):
+        if self.status is not None:
+            try:
+                self.status.configure(text=self.model["nodes"][k]["words"])
+            except tk.TclError:
+                pass
+
+    def _node_at(self, x, y):
+        for k, n in enumerate(self.model["nodes"]):
+            if (n["x"] - x) ** 2 + (n["y"] - y) ** 2 <= 26 ** 2:
+                return k
+        return None
+
+    def _hover(self, e):
+        k = self._node_at(e.x, e.y)
+        if k is not None:
+            self._say(k)
+
+    def _click(self, e):
+        self.focus_set()
+        k = self._node_at(e.x, e.y)
+        if k is not None:
+            self.open(k)
+
+    def move(self, step):
+        self.focus_idx = (self.focus_idx + step) % len(self.model["nodes"])
+        self.draw()
+        return "break"
+
+    def open(self, k):
+        tid = self.model["nodes"][k]["tid"]
+        if self.on_open:
+            self.on_open(tid)
+        return "break"
+
+
+MAP_OVERVIEW_SETTING = "map_overview"
+
+
+def view_map(app, parent):
+    conn = app.conn
+    wrap = ctk.CTkFrame(parent, fg_color="transparent")
+    wrap.pack(fill="both", expand=True, padx=28, pady=22)
+    section_title(wrap, "Map", "Every exam area and skill, in the same place every time. "
+                  "Click an area to open it, a skill to ask about it.").pack(anchor="w", fill="x", pady=(0, 10))
+    top = ctk.CTkFrame(wrap, fg_color="transparent")
+    top.pack(fill="x", pady=(0, 4))
+    focus = getattr(app, "_map_focus", None)
+    app._map_focus = None
+    mode = get_setting(conn, MAP_OVERVIEW_SETTING, "Wheel") or "Wheel"
+    if focus and focus.get("tid"):
+        mode = "Areas"
+    var = ctk.StringVar(value=mode if mode in ("Wheel", "Areas") else "Wheel")
+
+    def switch(v):
+        set_setting(conn, MAP_OVERVIEW_SETTING, v)
+        app.show_view("map")
+    ctk.CTkLabel(top, text="Overview", font=(FONT_BODY, 10), text_color=C.INK_DIM).pack(side="left", padx=(0, 4))
+    ctk.CTkSegmentedButton(top, values=["Wheel", "Areas"], variable=var, command=switch).pack(side="left")
+    depth_control(top, app, "map").pack(side="right")
+    if var.get() == "Wheel" and "area_wheel" in blocks_for("map", view_depth(conn, "map")):
+        body = ctk.CTkFrame(wrap, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+        status = ctk.CTkLabel(body, text="", font=(FONT_BODY, 12), text_color=C.INK, anchor="w", justify="left")
+
+        def open_area(tid):
+            set_setting(conn, MAP_OVERVIEW_SETTING, "Areas")
+            app._map_focus = {"tid": tid}
+            app.show_view("map")
+        wheel = AreaWheel(body, app, size=600, on_open=open_area, status=status)
+        wheel.pack(anchor="center", pady=(4, 6))
+        status.pack(anchor="center")
+        ctk.CTkLabel(body, text=("Closer to the centre and darker: more evidence. The brass arc: how much of the area "
+                                 "is under way. Arrow keys move around the wheel; Enter opens an area."),
+                     font=(FONT_BODY, 10), text_color=C.INK_DIM, wraplength=620, justify="center").pack(pady=(4, 6))
+        acc = ctk.CTkFrame(body, fg_color="transparent")
+        acc.pack(anchor="center")
+        ttk.Button(acc, text="List view", command=lambda: switch("Areas")).pack(side="left", padx=4)
+        ttk.Button(acc, text="Open for screen readers", command=lambda: vis_open_web_map(app)).pack(side="left", padx=4)
+        app._area_wheel = wheel
+        wheel.focus_set()
+        return wheel
+    cm = CourseMap(wrap, app, height=560, depth=view_depth(conn, "map"))
+    cm.pack(fill="both", expand=True)
+    if focus and focus.get("tid"):
+        wrap.after(60, lambda: (cm.open_domain(focus["tid"], animate=False),
+                                cm.select_skill(focus["sid"]) if focus.get("sid") else None))
+    return cm
+
+
+# ---- Insights and Practice renderers ------------------------------------------------------
+
+def render_confidence_misleads(app, wrap):
+    conn = app.conn
+    pm = present_confidence_misleads(conn)
+    c = card(wrap)
+    c.pack(fill="x", pady=(0, 10))
+    i = ctk.CTkFrame(c, fg_color="transparent")
+    i.pack(fill="x", padx=16, pady=12)
+    _v95_label(i, "Where confidence misleads you", bold=True, size=13)
+    if not pm["enough"]:
+        _v95_label(i, "Rate how sure you are after answers, and this fills in.", dim=True, size=11)
+        return pm
+    grid = ctk.CTkFrame(i, fg_color="transparent")
+    grid.pack(fill="x", pady=(6, 0))
+    for k, cell in enumerate(pm["cells"]):
+        r, col = divmod(k, 2)
+        grid.columnconfigure(col, weight=1, uniform="quad")
+        cc = card(grid, fg_color=C.NAVY if cell["key"] == "confident_wrong" else C.PAPER_DIM)
+        cc.grid(row=r, column=col, sticky="nsew", padx=4, pady=4)
+        dark = cell["key"] == "confident_wrong"
+        ctk.CTkLabel(cc, text=f"{cell['title']}  \u00b7  {_plural(cell['count'], 'answer')}", font=(FONT_BODY, 12, "bold"),
+                     text_color=C.CREAM if dark else C.INK, anchor="w").pack(anchor="w", padx=12, pady=(10, 0))
+        ctk.CTkLabel(cc, text=cell["words"], font=(FONT_BODY, 11), text_color=C.CREAM if dark else C.INK_DIM,
+                     anchor="w", justify="left", wraplength=300).pack(anchor="w", padx=12, pady=(0, 10))
+    if pm["drill_ids"]:
+        _v95_label(i, "Sure but wrong, most recent first:", bold=True, size=11, pady=(8, 0))
+        for stem in pm["drill_stems"]:
+            _v95_label(i, "\u2022 " + stem[:120], size=11)
+        ghost_button(i, f"Practise these {len(pm['drill_ids'])}",
+                     lambda: drill_questions(app, pm["drill_ids"], "Sure but wrong",
+                                             "Take each slowly. Say why before you choose.")).pack(anchor="w", pady=(8, 0))
+    return pm
+
+
+def render_underneath_and_clusters(app, wrap, show):
+    conn = app.conn
+    if "underneath" in show:
+        u = present_underneath(conn)
+        if u:
+            c = card(wrap, fg_color=C.NAVY)
+            c.pack(fill="x", pady=(10, 0))
+            i = ctk.CTkFrame(c, fg_color="transparent")
+            i.pack(fill="x", padx=16, pady=12)
+            ctk.CTkLabel(i, text="One thing underneath several misses", font=(FONT_BODY, 11, "bold"),
+                         text_color=C.GOLD_SOFT if hasattr(C, "GOLD_SOFT") else C.CREAM, anchor="w").pack(anchor="w")
+            ctk.CTkLabel(i, text=u["line"], font=(FONT_BODY, 12), text_color=C.CREAM, anchor="w", justify="left",
+                         wraplength=640).pack(anchor="w", pady=(2, 8))
+            if u["drill_ids"]:
+                primary_button(i, f"Practise {u['label'][:40]}",
+                               lambda: drill_questions(app, u["drill_ids"], u["label"],
+                                                       "The skill several of your misses rest on.")).pack(anchor="w")
+    if "miss_clusters" in show:
+        c = card(wrap)
+        c.pack(fill="x", pady=(10, 0))
+        i = ctk.CTkFrame(c, fg_color="transparent")
+        i.pack(fill="x", padx=16, pady=12)
+        _v95_label(i, "Misses that share an idea", bold=True, size=13)
+        holder = ctk.CTkFrame(i, fg_color="transparent")
+        holder.pack(fill="x")
+        wait = _v95_label(holder, "Grouping your recent misses\u2026", dim=True, size=11)
+        result = {}
+
+        def worker():
+            wconn = db_connect()
+            try:
+                result["clusters"] = present_miss_clusters(wconn)
+            except Exception:
+                result["clusters"] = []
+            finally:
+                wconn.close()
+        t = _threading_v96.Thread(target=worker, daemon=True)
+        t.start()
+
+        def poll():
+            if t.is_alive():
+                holder.after(150, poll)
+                return
+            try:
+                wait.destroy()
+            except tk.TclError:
+                return
+            clusters = result.get("clusters") or []
+            if not clusters:
+                _v95_label(holder, "Not enough misses yet to group.", dim=True, size=11)
+            for cl in clusters:
+                cc = card(holder, fg_color=C.PAPER_DIM)
+                cc.pack(fill="x", pady=(6, 0))
+                ci = ctk.CTkFrame(cc, fg_color="transparent")
+                ci.pack(fill="x", padx=12, pady=10)
+                _v95_label(ci, cl["title"], bold=True, size=12)
+                if cl["also"]:
+                    _v95_label(ci, "Also touches " + ", ".join(cl["also"]), dim=True, size=10)
+                _v95_label(ci, "For example: " + cl["example"][:140], size=11)
+                ghost_button(ci, "Practise this group",
+                             lambda ids=cl["drill_ids"], t_=cl["title"]: drill_questions(
+                                 app, ids, t_, "Misses that share one idea, back to back.")).pack(anchor="w", pady=(6, 0))
+            app._clusters_rendered = clusters
+        poll()
+
+
+def render_pace_lists(app, wrap):
+    pl = present_pace_lists(app.conn)
+    if not pl:
+        return None
+    for key, timed in (("slow", True), ("fast", False)):
+        sec = pl[key]
+        if not sec["ids"]:
+            continue
+        c = card(wrap)
+        c.pack(fill="x", pady=(10, 0))
+        i = ctk.CTkFrame(c, fg_color="transparent")
+        i.pack(fill="x", padx=16, pady=12)
+        _v95_label(i, f"{sec['title']}  \u00b7  {_plural(len(sec['ids']), 'question')}", bold=True, size=13)
+        _v95_label(i, sec["words"], dim=True, size=11)
+        for stem in sec["stems"]:
+            _v95_label(i, "\u2022 " + stem[:110], size=11)
+        ghost_button(i, "Paced drill on these" if timed else "Re-read these slowly",
+                     lambda ids=sec["ids"], t=timed, ti=sec["title"]: drill_questions(
+                         app, ids, ti, ("Same questions, at exam pace." if t else
+                                        "Read every word of the question before choosing."),
+                         timed=t, back="practice")).pack(anchor="w", pady=(8, 0))
+    return pl
+
+
+# ---- standing catalogue: V9.6 -------------------------------------------------------------------
+
+def _v96_words_ok(obj):
+    text = json.dumps(obj)
+    return not (re.search(r"\d+\.\d+|%", text) or re.search(r"\b(theta|probabilit|P\(pass\))", text, re.I))
+
+
+def _probe_v96_area_wheel(conn, inject=False):
+    vs = _vis_seed_state()
+    vs = dict(vs, answers=dict(vs["answers"]))
+    order = vis_domain_order()
+    for s in vis_skills_of(order[0]):
+        vs["answers"][s] = 50
+    for s in vis_skills_of(order[1]):
+        vs["answers"][s] = 0
+    w = present_area_wheel(vs)
+    n0, n1 = w["nodes"][0], w["nodes"][1]
+    d = lambda n: math.hypot(n["x"] - w["cx"], n["y"] - w["cy"])
+    if inject:
+        n0, n1 = n1, n0
+    if not d(n0) < d(n1) or not n0["softness"] < n1["softness"]:
+        return False, "an area with more evidence does not sit closer to the centre and darker"
+    if [n["tid"] for n in w["nodes"]] != order:
+        return False, "wheel positions do not follow the curriculum order"
+    worst = max(n["softness"] for n in w["nodes"])
+    faded = _blend_hex(C.NAVY, C.PAPER_DIM, worst)
+    if contrast_ratio(faded, C.PAPER) < 3.0:
+        return False, "the softest wheel node falls below 3:1 contrast"
+    if not _v96_words_ok([n["words"] for n in w["nodes"]] + [w["centre"]]):
+        return False, "wheel words carry decimals, percentages or engine terms"
+    import inspect
+    src = inspect.getsource(view_map)
+    if "Open for screen readers" not in src or '"<Return>"' not in inspect.getsource(AreaWheel.__init__):
+        return False, "the wheel has no keyboard or screen-reader path"
+    return True, "evidence sets distance and softness, positions follow the curriculum, contrast holds, words only, keyboard and screen reader"
+
+
+def _probe_v96_confidence_misleads(conn, inject=False):
+    init_schema(conn)
+    qs = list(QUIZ_BANK.values())
+    for k in range(16):
+        q = qs[k]
+        ok = k % 2 == 0
+        conn.execute("INSERT INTO attempts (question_id, topic_id, correct, mode, timestamp, confidence) VALUES (?,?,?,?,?,?)",
+                     (q["id"], q["topic"], int(ok), "quiz", datetime.now().isoformat(), 3 if k % 4 < 2 else 1))
+    conn.commit()
+    pm = present_confidence_misleads(conn)
+    truth = set(confidence_quadrants(conn)["confident_wrong"])
+    ids = pm["drill_ids"] + (["q_not_confident"] if inject else [])
+    if not ids or not set(ids) <= truth:
+        return False, "the sure-but-wrong practice includes questions from another cell"
+    if not _v96_words_ok(pm["cells"]):
+        return False, "the confidence grid carries percentages, decimals or engine terms"
+    import inspect
+    src = inspect.getsource(render_confidence_misleads)
+    if "STAMP" in src:
+        return False, "the confidence grid paints the learner red"
+    return True, "the 2x2 in words, no red; the practise button serves exactly the sure-but-wrong questions"
+
+
+def _probe_v96_pace_lists(conn, inject=False):
+    init_schema(conn)
+    qs = list(QUIZ_BANK.values())
+    for k in range(40):
+        q = qs[k]
+        t = 300.0 if k < 5 else (2.0 if k < 10 else 60.0)
+        ok = k < 5 or k >= 10
+        conn.execute("INSERT INTO attempts (question_id, topic_id, correct, mode, timestamp, time_taken) VALUES (?,?,?,?,?,?)",
+                     (q["id"], q["topic"], int(ok), "quiz", datetime.now().isoformat(), t))
+    conn.commit()
+    pl = present_pace_lists(conn)
+    s = timing_summary(conn)
+    slow_truth = {r["question_id"] for r in s["slow_correct"]}
+    fast_truth = {r["question_id"] for r in s["fast_wrong"]}
+    fast_ids = set(pl["fast"]["ids"]) | ({qs[20]["id"]} if inject else set())
+    if not set(pl["slow"]["ids"]) <= slow_truth or not fast_ids <= fast_truth:
+        return False, "pace lists include answers outside their category (fast lists must be fast AND wrong)"
+    import inspect
+    src = inspect.getsource(render_pace_lists)
+    if '(("slow", True), ("fast", False))' not in src:
+        return False, "the timed drill is not reserved for right-but-slow answers"
+    if not _v96_words_ok([pl["slow"]["words"], pl["fast"]["words"], pl["slow"]["title"], pl["fast"]["title"]]):
+        return False, "pace words carry numbers"
+    return True, "right-but-slow gets a paced drill, fast-and-wrong a slow re-read; only the right answers are listed"
+
+
+def _probe_v96_insights_full(conn, inject=False):
+    init_schema(conn)
+    for surface, name, level in (("map", "area_wheel", "Quiet"), ("insights", "confidence_misleads", "Standard"),
+                                 ("insights", "underneath", "Full"), ("insights", "miss_clusters", "Full"),
+                                 ("practice", "pace_lists", "Full")):
+        got = dict(DEPTH_REGIONS[surface]).get(name)
+        if inject and name == "underneath":
+            got = "Quiet"
+        if got != level:
+            return False, f"{name} is placed at {got}, not {level}"
+    ok, detail = _probe_v94_depth_contract(conn)
+    if not ok:
+        return False, "adding V9.6 regions broke the depth contract: " + detail
+    import inspect
+    src = inspect.getsource(render_underneath_and_clusters)
+    if "_threading_v96.Thread" not in src or "db_connect()" not in src:
+        return False, "grouping misses runs on the interface thread"
+    clusters = present_miss_clusters(conn)
+    if not _v96_words_ok([{k: v for k, v in c.items() if k != "example"} for c in clusters]):
+        return False, "cluster titles carry numbers beyond counts"
+    return True, "wheel at Quiet, confidence at Standard, underneath and clusters at Full, pace lists at Full; grouping off the interface thread"
+
+
+for _name, _spec in (
+    ("v96_wheel_without_meaning", {"title": "A beautiful overview that says nothing true",
+        "failure_class": "A radial map whose position, distance or softness is decoration, faint below contrast, or mouse-only.",
+        "invariant": "Curriculum sets position; evidence sets distance and softness; contrast, words and keyboard hold.",
+        "found_in": "V9.6 area wheel, from the earlier radial learner model.", "probe": _probe_v96_area_wheel}),
+    ("v96_confidence_grid_as_verdict", {"title": "A confidence grid that scolds",
+        "failure_class": "Showing the confident-wrong count in red, or practising the wrong questions.",
+        "invariant": "Words, no red; the practise button serves exactly the sure-but-wrong questions.",
+        "found_in": "V9.6, from the earlier Blind Spots view.", "probe": _probe_v96_confidence_misleads}),
+    ("v96_pace_mislabelled", {"title": "Guessing and slowness treated alike",
+        "failure_class": "Listing every fast answer as a problem, or drilling guesses against a clock.",
+        "invariant": "Fast lists are fast and wrong; only right-but-slow answers get a paced drill.",
+        "found_in": "V9.6, from the earlier Timing view.", "probe": _probe_v96_pace_lists}),
+    ("v96_rich_regions_unplaced", {"title": "Rich screens back without placement",
+        "failure_class": "Restored views that bypass Depth or block the interface while computing.",
+        "invariant": "Each restored region has its depth; grouping misses runs on a worker thread.",
+        "found_in": "V9.6.", "probe": _probe_v96_insights_full}),
+):
+    register_adversarial_class(_name, _spec)
+
+VIEW_MAP["map"] = view_map
+VIEW_MAP["progress"] = view_map
 
 
 def main():
